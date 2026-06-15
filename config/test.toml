@@ -1,0 +1,24 @@
+# Context Graph Test Configuration
+# Fast, deterministic settings for testing
+
+[general]
+phase = "ghost"
+log_level = "warn"
+
+[server]
+transport = "stdio"
+
+[storage]
+backend = "memory"
+
+[embeddings]
+provider = "stub"
+
+[cuda]
+device_id = 0
+
+[utl]
+consolidation_threshold = 0.5
+
+[graph]
+max_edges_per_node = 10

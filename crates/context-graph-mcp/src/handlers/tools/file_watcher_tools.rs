@@ -1,0 +1,735 @@
+//! File watcher tool handlers.
+//!
+//! Per PRD v6 Section 10, implements:
+//! - list_watched_files: List all files with embeddings
+//! - get_file_watcher_stats: Get statistics about file watcher content
+//! - delete_file_content: Delete all embeddings for a specific file
+//! - reconcile_files: Find orphaned files and optionally delete them
+//!
+//! Constitution Compliance:
+//! - SEC-06: Soft delete 30-day recovery
+//! - FAIL FAST: All tools error on failures, no fallbacks
+
+use std::path::Path;
+
+use glob::Pattern;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use context_graph_core::types::audit::{AuditOperation, AuditRecord, AuditResult};
+
+use crate::protocol::{JsonRpcId, JsonRpcResponse};
+
+use super::super::Handlers;
+use super::helpers::ToolErrorKind;
+
+// ============================================================================
+// Request/Response DTOs
+// ============================================================================
+
+/// Request for list_watched_files.
+#[derive(Debug, Deserialize)]
+pub struct ListWatchedFilesRequest {
+    #[serde(default = "default_true")]
+    pub include_counts: bool,
+    pub path_filter: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Response for list_watched_files.
+#[derive(Debug, Serialize)]
+pub struct ListWatchedFilesResponse {
+    pub files: Vec<WatchedFileInfo>,
+    pub total_files: usize,
+}
+
+/// Information about a watched file.
+#[derive(Debug, Serialize)]
+pub struct WatchedFileInfo {
+    pub file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
+}
+
+/// Response for get_file_watcher_stats.
+#[derive(Debug, Serialize)]
+pub struct GetFileWatcherStatsResponse {
+    pub total_files: usize,
+    pub total_chunks: usize,
+    pub avg_chunks_per_file: f64,
+    pub min_chunks: usize,
+    pub max_chunks: usize,
+}
+
+/// Request for delete_file_content.
+#[derive(Debug, Deserialize)]
+pub struct DeleteFileContentRequest {
+    pub file_path: String,
+    #[serde(default = "default_true")]
+    pub soft_delete: bool,
+}
+
+/// Response for delete_file_content.
+#[derive(Debug, Serialize)]
+pub struct DeleteFileContentResponse {
+    pub file_path: String,
+    pub deleted_count: usize,
+    pub soft_delete: bool,
+    pub message: String,
+}
+
+/// Request for reconcile_files.
+#[derive(Debug, Deserialize)]
+pub struct ReconcileFilesRequest {
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    pub base_path: Option<String>,
+}
+
+/// Response for reconcile_files.
+#[derive(Debug, Serialize)]
+pub struct ReconcileFilesResponse {
+    pub orphaned_files: Vec<String>,
+    pub orphan_count: usize,
+    /// Number of individual fingerprints deleted (not files -- each file may have multiple fingerprints).
+    pub fingerprints_deleted: usize,
+    /// Number of fingerprints that were already deleted or not found (Ok(false) from store).
+    pub skipped: usize,
+    pub dry_run: bool,
+    /// ERR-13: Track which deletions failed instead of silently continuing
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_deletions: Vec<String>,
+}
+
+// ============================================================================
+// Handler Implementations
+// ============================================================================
+
+impl Handlers {
+    /// Handle list_watched_files tool call.
+    ///
+    /// Lists all files that have embeddings in the knowledge graph.
+    ///
+    /// # Arguments
+    /// * `id` - JSON-RPC request ID
+    /// * `arguments` - Tool arguments (include_counts, path_filter)
+    ///
+    /// # Returns
+    /// JsonRpcResponse with ListWatchedFilesResponse
+    pub(crate) async fn call_list_watched_files(
+        &self,
+        id: Option<JsonRpcId>,
+        arguments: serde_json::Value,
+    ) -> JsonRpcResponse {
+        debug!("Handling list_watched_files");
+
+        // Parse request
+        let request: ListWatchedFilesRequest = match serde_json::from_value(arguments) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "list_watched_files: Failed to parse request");
+                return self.tool_error(id, &format!("Invalid params: {}", e));
+            }
+        };
+
+        // Get indexed files from store
+        let entries = match self.teleological_store.list_indexed_files().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!(error = %e, "list_watched_files: Failed to list indexed files");
+                return self.tool_error(id, &format!("Storage error: Failed to list files: {}", e));
+            }
+        };
+
+        // Compile glob pattern if provided
+        let pattern: Option<Pattern> = if let Some(ref filter) = request.path_filter {
+            match Pattern::new(filter) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    error!(error = %e, pattern = filter, "list_watched_files: Invalid glob pattern");
+                    return self
+                        .tool_error(id, &format!("Invalid glob pattern '{}': {}", filter, e));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Filter and convert to response
+        let files: Vec<WatchedFileInfo> = entries
+            .iter()
+            .filter(|entry| {
+                // Apply glob filter if provided
+                if let Some(ref p) = pattern {
+                    p.matches(&entry.file_path)
+                } else {
+                    true
+                }
+            })
+            .map(|entry| WatchedFileInfo {
+                file_path: entry.file_path.clone(),
+                chunk_count: if request.include_counts {
+                    Some(entry.fingerprint_count())
+                } else {
+                    None
+                },
+                last_updated: Some(entry.last_updated.to_rfc3339()),
+            })
+            .collect();
+
+        let response = ListWatchedFilesResponse {
+            total_files: files.len(),
+            files,
+        };
+
+        info!(
+            "list_watched_files: Returned {} files{}",
+            response.total_files,
+            if request.path_filter.is_some() {
+                " (filtered)"
+            } else {
+                ""
+            }
+        );
+
+        match serde_json::to_value(response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => self.tool_error(id, &format!("Response serialization failed: {}", e)),
+        }
+    }
+
+    /// Handle get_file_watcher_stats tool call.
+    ///
+    /// Returns statistics about file watcher content in the knowledge graph.
+    ///
+    /// # Arguments
+    /// * `id` - JSON-RPC request ID
+    ///
+    /// # Returns
+    /// JsonRpcResponse with GetFileWatcherStatsResponse
+    pub(crate) async fn call_get_file_watcher_stats(
+        &self,
+        id: Option<JsonRpcId>,
+    ) -> JsonRpcResponse {
+        debug!("Handling get_file_watcher_stats");
+
+        // Get stats from store
+        let stats = match self.teleological_store.get_file_watcher_stats().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "get_file_watcher_stats: Failed to get stats");
+                return self.tool_error(id, &format!("Storage error: Failed to get stats: {}", e));
+            }
+        };
+
+        let response = GetFileWatcherStatsResponse {
+            total_files: stats.total_files,
+            total_chunks: stats.total_chunks,
+            avg_chunks_per_file: stats.avg_chunks_per_file,
+            min_chunks: stats.min_chunks,
+            max_chunks: stats.max_chunks,
+        };
+
+        info!(
+            "get_file_watcher_stats: {} files, {} chunks",
+            response.total_files, response.total_chunks
+        );
+
+        match serde_json::to_value(response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => self.tool_error(id, &format!("Response serialization failed: {}", e)),
+        }
+    }
+
+    /// Handle delete_file_content tool call.
+    ///
+    /// Deletes all embeddings for a specific file path.
+    ///
+    /// # Arguments
+    /// * `id` - JSON-RPC request ID
+    /// * `arguments` - Tool arguments (file_path, soft_delete)
+    ///
+    /// # Returns
+    /// JsonRpcResponse with DeleteFileContentResponse
+    ///
+    /// # Constitution Compliance
+    /// - SEC-06: 30-day recovery for soft delete
+    pub(crate) async fn call_delete_file_content(
+        &self,
+        id: Option<JsonRpcId>,
+        arguments: serde_json::Value,
+    ) -> JsonRpcResponse {
+        debug!("Handling delete_file_content");
+
+        // Parse request
+        let request: DeleteFileContentRequest = match serde_json::from_value(arguments) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "delete_file_content: Failed to parse request");
+                return self.tool_error(id, &format!("Invalid params: {}", e));
+            }
+        };
+
+        // Validate file_path is not empty
+        if request.file_path.trim().is_empty() {
+            error!("delete_file_content: Empty file_path provided");
+            return self.tool_error(id, "file_path cannot be empty");
+        }
+
+        // Get fingerprints for the file
+        let fingerprint_ids = match self
+            .teleological_store
+            .get_fingerprints_for_file(&request.file_path)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                error!(error = %e, file_path = %request.file_path, "delete_file_content: Failed to get fingerprints");
+                return self.tool_error(
+                    id,
+                    &format!("Storage error: Failed to get fingerprints: {}", e),
+                );
+            }
+        };
+
+        if fingerprint_ids.is_empty() {
+            info!(
+                file_path = %request.file_path,
+                "delete_file_content: No fingerprints found for file"
+            );
+            return self.tool_result(
+                id,
+                json!({
+                    "file_path": request.file_path,
+                    "deleted_count": 0,
+                    "soft_delete": request.soft_delete,
+                    "message": "No embeddings found for this file"
+                }),
+            );
+        }
+
+        // Delete each fingerprint
+        let mut deleted_count = 0;
+        for fp_id in &fingerprint_ids {
+            match self
+                .teleological_store
+                .delete(*fp_id, request.soft_delete)
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .verify_deleted_fingerprint_readback(*fp_id, "delete_file_content")
+                        .await
+                    {
+                        error!(
+                            error = %e,
+                            fingerprint_id = %fp_id,
+                            "delete_file_content: Delete readback failed"
+                        );
+                        return self.tool_error(id, &format!("Storage error: {}", e));
+                    }
+                    deleted_count += 1;
+                    debug!(
+                        fingerprint_id = %fp_id,
+                        soft_delete = request.soft_delete,
+                        "delete_file_content: Deleted fingerprint"
+                    );
+                }
+                Ok(false) => {
+                    warn!(
+                        fingerprint_id = %fp_id,
+                        "delete_file_content: Fingerprint not found (may have been deleted concurrently)"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        fingerprint_id = %fp_id,
+                        "delete_file_content: Failed to delete fingerprint"
+                    );
+                    return self.tool_error(
+                        id,
+                        &format!(
+                            "Storage error: Failed to delete fingerprint {}: {}",
+                            fp_id, e
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Clear the file index — FAIL FAST if this fails to prevent ghost entries
+        if let Err(e) = self
+            .teleological_store
+            .clear_file_index(&request.file_path)
+            .await
+        {
+            error!(
+                error = %e,
+                file_path = %request.file_path,
+                deleted_count = deleted_count,
+                "delete_file_content: Failed to clear file index — ghost entries remain"
+            );
+            return self.tool_error(
+                id,
+                &format!(
+                    "Deleted {} fingerprints but failed to clear file index for '{}': {}. \
+                     File index may contain stale entries — retry or manually clear.",
+                    deleted_count, request.file_path, e
+                ),
+            );
+        }
+        if let Err(e) = self
+            .verify_file_index_cleared_readback(&request.file_path, "delete_file_content")
+            .await
+        {
+            error!(
+                error = %e,
+                file_path = %request.file_path,
+                deleted_count = deleted_count,
+                "delete_file_content: File index clear readback failed"
+            );
+            return self.tool_error(id, &format!("Storage error: {}", e));
+        }
+
+        let message = if request.soft_delete {
+            format!(
+                "Soft-deleted {} embeddings for '{}' (30-day recovery per SEC-06)",
+                deleted_count, request.file_path
+            )
+        } else {
+            format!(
+                "HARD-deleted {} embeddings for '{}' (no recovery possible)",
+                deleted_count, request.file_path
+            )
+        };
+
+        info!(
+            file_path = %request.file_path,
+            deleted_count = deleted_count,
+            soft_delete = request.soft_delete,
+            "delete_file_content: Operation complete"
+        );
+
+        // Emit FileWatcherEvent audit record for this destructive operation
+        let audit_record = AuditRecord::new(
+            AuditOperation::FileWatcherEvent {
+                event_type: if request.soft_delete {
+                    "soft_delete".to_string()
+                } else {
+                    "hard_delete".to_string()
+                },
+                file_path: request.file_path.clone(),
+                memories_affected: deleted_count,
+            },
+            // Use nil UUID since this targets a file path, not a single memory
+            Uuid::nil(),
+        )
+        .with_operator("delete_file_content")
+        .with_rationale(format!(
+            "{} {} embeddings for '{}'",
+            if request.soft_delete {
+                "Soft-deleted"
+            } else {
+                "Hard-deleted"
+            },
+            deleted_count,
+            request.file_path
+        ))
+        .with_parameters(json!({
+            "file_path": request.file_path,
+            "soft_delete": request.soft_delete,
+            "deleted_count": deleted_count,
+        }));
+
+        if let Err(e) = self
+            .append_audit_record_with_readback(&audit_record, "delete_file_content")
+            .await
+        {
+            error!(error = %e, "delete_file_content: Audit append/readback failed");
+            return self.tool_error(id, &format!("Storage error: {}", e));
+        }
+
+        let response = DeleteFileContentResponse {
+            file_path: request.file_path,
+            deleted_count,
+            soft_delete: request.soft_delete,
+            message,
+        };
+
+        match serde_json::to_value(response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => self.tool_error(id, &format!("Response serialization failed: {}", e)),
+        }
+    }
+
+    /// Handle reconcile_files tool call.
+    ///
+    /// Finds orphaned files (embeddings exist but file doesn't on disk)
+    /// and optionally deletes them.
+    ///
+    /// # Arguments
+    /// * `id` - JSON-RPC request ID
+    /// * `arguments` - Tool arguments (dry_run, base_path)
+    ///
+    /// # Returns
+    /// JsonRpcResponse with ReconcileFilesResponse
+    pub(crate) async fn call_reconcile_files(
+        &self,
+        id: Option<JsonRpcId>,
+        arguments: serde_json::Value,
+    ) -> JsonRpcResponse {
+        debug!("Handling reconcile_files");
+
+        // Parse request
+        let request: ReconcileFilesRequest = match serde_json::from_value(arguments) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "reconcile_files: Failed to parse request");
+                return self.tool_error(id, &format!("Invalid params: {}", e));
+            }
+        };
+
+        // Get indexed files from store
+        let entries = match self.teleological_store.list_indexed_files().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!(error = %e, "reconcile_files: Failed to list indexed files");
+                return self.tool_error(id, &format!("Storage error: Failed to list files: {}", e));
+            }
+        };
+
+        let mut orphans = Vec::new();
+        let mut fingerprints_deleted = 0;
+        let mut skipped = 0;
+        let mut failed_deletions: Vec<String> = Vec::new();
+
+        for entry in entries {
+            // Apply base_path filter if provided
+            if let Some(ref base) = request.base_path {
+                if !entry.file_path.starts_with(base) {
+                    continue;
+                }
+            }
+
+            // Check if file exists on disk
+            if !Path::new(&entry.file_path).exists() {
+                orphans.push(entry.file_path.clone());
+
+                if !request.dry_run {
+                    // Delete all fingerprints for this file
+                    let ids = match self
+                        .teleological_store
+                        .get_fingerprints_for_file(&entry.file_path)
+                        .await
+                    {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                file_path = %entry.file_path,
+                                "reconcile_files: Failed to get fingerprints for orphan"
+                            );
+                            failed_deletions.push(format!("{}:fetch_error:{}", entry.file_path, e));
+                            continue;
+                        }
+                    };
+
+                    let fp_count = ids.len();
+                    for fp_id in ids {
+                        // Use soft delete per SEC-06
+                        match self.teleological_store.delete(fp_id, true).await {
+                            Ok(true) => {
+                                if let Err(e) = self
+                                    .verify_deleted_fingerprint_readback(fp_id, "reconcile_files")
+                                    .await
+                                {
+                                    error!(
+                                        error = %e,
+                                        fingerprint_id = %fp_id,
+                                        "reconcile_files: Delete readback failed"
+                                    );
+                                    failed_deletions.push(format!(
+                                        "{}:{}:readback_error:{}",
+                                        entry.file_path, fp_id, e
+                                    ));
+                                    continue;
+                                }
+                                fingerprints_deleted += 1;
+                            }
+                            Ok(false) => {
+                                // MCP-L12: Track fingerprints already deleted or not found
+                                skipped += 1;
+                                debug!(
+                                    fingerprint_id = %fp_id,
+                                    "reconcile_files: Fingerprint already deleted or not found"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    fingerprint_id = %fp_id,
+                                    "reconcile_files: Failed to delete orphan fingerprint"
+                                );
+                                failed_deletions.push(format!("{}:{}", entry.file_path, fp_id));
+                            }
+                        }
+                    }
+
+                    // Clear the file index
+                    if let Err(e) = self
+                        .teleological_store
+                        .clear_file_index(&entry.file_path)
+                        .await
+                    {
+                        error!(
+                            error = %e,
+                            file_path = %entry.file_path,
+                            "reconcile_files: Failed to clear file index for orphan"
+                        );
+                        failed_deletions
+                            .push(format!("{}:clear_index_error:{}", entry.file_path, e));
+                    } else if let Err(e) = self
+                        .verify_file_index_cleared_readback(&entry.file_path, "reconcile_files")
+                        .await
+                    {
+                        error!(
+                            error = %e,
+                            file_path = %entry.file_path,
+                            "reconcile_files: File index clear readback failed"
+                        );
+                        failed_deletions.push(format!(
+                            "{}:clear_index_readback_error:{}",
+                            entry.file_path, e
+                        ));
+                    }
+
+                    info!(
+                        file_path = %entry.file_path,
+                        fingerprints_deleted = fp_count,
+                        "reconcile_files: Deleted orphaned file embeddings"
+                    );
+                }
+            }
+        }
+
+        info!(
+            orphan_count = orphans.len(),
+            fingerprints_deleted = fingerprints_deleted,
+            skipped = skipped,
+            dry_run = request.dry_run,
+            "reconcile_files: Operation complete"
+        );
+
+        // Emit FileWatcherEvent audit record for reconcile when the command mutated
+        // or detected partial mutation failure.
+        if !request.dry_run && (fingerprints_deleted > 0 || !failed_deletions.is_empty()) {
+            let audit_record = AuditRecord::new(
+                AuditOperation::FileWatcherEvent {
+                    event_type: "reconcile_delete".to_string(),
+                    file_path: request.base_path.clone().unwrap_or_default(),
+                    memories_affected: fingerprints_deleted,
+                },
+                Uuid::nil(),
+            )
+            .with_operator("reconcile_files")
+            .with_rationale(format!(
+                "Reconciled {} orphaned files ({} fingerprints deleted, {} skipped)",
+                orphans.len(),
+                fingerprints_deleted,
+                skipped
+            ))
+            .with_parameters(json!({
+                "orphan_count": orphans.len(),
+                "fingerprints_deleted": fingerprints_deleted,
+                "skipped": skipped,
+                "dry_run": false,
+                "base_path": request.base_path,
+                "orphaned_files": &orphans,
+                "failed_deletions": &failed_deletions,
+            }))
+            .with_result(if failed_deletions.is_empty() {
+                AuditResult::Success
+            } else {
+                AuditResult::Partial {
+                    warnings: failed_deletions.clone(),
+                }
+            });
+
+            if let Err(e) = self
+                .append_audit_record_with_readback(&audit_record, "reconcile_files")
+                .await
+            {
+                error!(error = %e, "reconcile_files: Audit append/readback failed");
+                return self.tool_error(id, &format!("Storage error: {}", e));
+            }
+        }
+
+        let response = ReconcileFilesResponse {
+            orphan_count: orphans.len(),
+            orphaned_files: orphans,
+            fingerprints_deleted,
+            skipped,
+            dry_run: request.dry_run,
+            failed_deletions,
+        };
+
+        if !response.failed_deletions.is_empty() {
+            return self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEMORY_RECONCILE_PARTIAL_FAILURE",
+                "reconcile_files completed with one or more delete/index/readback failures",
+                json!(response),
+            );
+        }
+
+        match serde_json::to_value(response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => self.tool_error(id, &format!("Response serialization failed: {}", e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_deserialization_defaults() {
+        let req: ListWatchedFilesRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.include_counts);
+        assert!(req.path_filter.is_none());
+        let req: DeleteFileContentRequest =
+            serde_json::from_str(r#"{"file_path": "/test/path.md"}"#).unwrap();
+        assert_eq!(req.file_path, "/test/path.md");
+        assert!(req.soft_delete);
+        let req: ReconcileFilesRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.dry_run);
+    }
+
+    #[test]
+    fn test_response_serialization() {
+        let info = WatchedFileInfo {
+            file_path: "/test/path.md".to_string(),
+            chunk_count: Some(5),
+            last_updated: Some("2024-01-15T10:30:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("file_path") && json.contains("chunk_count"));
+        let info_none = WatchedFileInfo {
+            file_path: "/test/path.md".to_string(),
+            chunk_count: None,
+            last_updated: None,
+        };
+        let json_none = serde_json::to_string(&info_none).unwrap();
+        assert!(!json_none.contains("chunk_count"));
+    }
+}

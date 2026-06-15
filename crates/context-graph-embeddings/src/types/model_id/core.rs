@@ -1,0 +1,308 @@
+//! Core ModelId enum definition and primary methods.
+
+use serde::{Deserialize, Serialize};
+
+use super::tokenizer::TokenizerFamily;
+
+/// Identifies one of the 15 embedding models in the Multi-Array Storage pipeline.
+///
+/// # Variants
+///
+/// | Variant | Model | Dimension | Type |
+/// |---------|-------|-----------|------|
+/// | Semantic | e5-large-v2 | 1024 | Pretrained |
+/// | TemporalRecent | Exponential decay | 512 | Custom |
+/// | TemporalPeriodic | Fourier basis | 512 | Custom |
+/// | TemporalPositional | Sinusoidal PE | 512 | Custom |
+/// | Causal | nomic-embed-v1.5 | 768 | Pretrained |
+/// | Sparse | SPLADE | ~30K sparse | Pretrained |
+/// | Code | Qodo-Embed-1-1.5B | 1536 | Pretrained |
+/// | Graph | e5-large-v2 | 1024 | Pretrained |
+/// | Hdc | Hyperdimensional | 10K-bit | Custom |
+/// | Contextual | e5-base-v2 (ContextualModel) | 768 | Pretrained |
+/// | Entity | KEPLER | 768 | Pretrained (DEPRECATED - use Kepler) |
+/// | Kepler | KEPLER (RoBERTa + TransE) | 768 | Pretrained |
+/// | LateInteraction | ColBERT | 128/token | Pretrained |
+/// | Splade | SPLADE v3 | ~30K sparse | Pretrained |
+/// | BgeM3Dense | BAAI/bge-m3 (dense head) | 1024 | Pretrained |
+///
+/// # Example
+///
+/// ```rust
+/// use context_graph_embeddings::types::ModelId;
+///
+/// let model = ModelId::Semantic;
+/// assert_eq!(model.dimension(), 1024);
+/// assert!(model.is_pretrained());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ModelId {
+    /// E1: Semantic embedding using intfloat/e5-large-v2 (1024D)
+    Semantic = 0,
+    /// E2: Temporal recency using exponential decay (512D, custom)
+    TemporalRecent = 1,
+    /// E3: Temporal periodicity using Fourier basis (512D, custom)
+    TemporalPeriodic = 2,
+    /// E4: Temporal position using sinusoidal encoding (512D, custom)
+    TemporalPositional = 3,
+    /// E5: Causal embedding using nomic-ai/nomic-embed-text-v1.5 (768D)
+    Causal = 4,
+    /// E6: Sparse lexical using naver/splade-cocondenser (~30K sparse -> 1536D projected)
+    Sparse = 5,
+    /// E7: Code embedding using Qodo-Embed-1-1.5B (1536D native)
+    Code = 6,
+    /// E8: Graph/sentence using intfloat/e5-large-v2 (1024D, upgraded from MiniLM 384D)
+    Graph = 7,
+    /// E9: Hyperdimensional computing (10K-bit -> 1024D projected, custom)
+    Hdc = 8,
+    /// E10: Contextual paraphrase using intfloat/e5-base-v2 (768D).
+    /// M5 FIX: Renamed from "Multimodal" (historical CLIP name) to match actual model.
+    /// serde(alias) preserves deserialization of existing JSON data.
+    #[serde(alias = "Multimodal")]
+    Contextual = 9,
+    /// E11: Entity using KEPLER (768D, upgraded from MiniLM 384D).
+    /// Prefer `ModelId::Kepler` for new code — `Entity` exists for backward-compatible matching.
+    Entity = 10,
+    /// E12: Late interaction using colbert-ir/colbertv2.0 (128D per token)
+    LateInteraction = 11,
+    /// E13: SPLADE v3 sparse embedding for Stage 1 recall in 5-stage pipeline
+    Splade = 12,
+    /// E11 (new): KEPLER - RoBERTa-base trained with TransE on Wikidata5M (768D)
+    /// Replaces Entity (all-MiniLM-L6-v2) for meaningful knowledge graph operations.
+    Kepler = 13,
+    /// E14: BGE-M3 dense head using BAAI/bge-m3 (1024D, XLM-RoBERTa-Large base).
+    /// Multilingual dense retrieval with 8192-token context. Pretrained.
+    BgeM3Dense = 14,
+}
+
+impl ModelId {
+    /// Returns the native output dimension of this model BEFORE any projection.
+    ///
+    /// Note: Sparse (30K) and Hdc (10K-bit) are projected to smaller dimensions
+    /// in downstream processing. This returns the raw model output size.
+    #[must_use]
+    pub const fn dimension(&self) -> usize {
+        match self {
+            Self::Semantic => 1024,
+            Self::TemporalRecent => 512,
+            Self::TemporalPeriodic => 512,
+            Self::TemporalPositional => 512,
+            Self::Causal => 768,
+            Self::Sparse => 30522, // SPLADE vocab size
+            Self::Code => 1536,    // Qodo-Embed-1-1.5B native dimension
+            Self::Graph => 1024,   // e5-large-v2 (upgraded from MiniLM 384D)
+            Self::Hdc => 10000,    // 10K-bit vector
+            Self::Contextual => 768,
+            Self::Entity => 384, // Legacy MiniLM-L6-v2 (use ModelId::Kepler for 768D production E11)
+            Self::LateInteraction => 128, // Per-token dimension
+            Self::Splade => 30522, // SPLADE v3 vocab size
+            Self::Kepler => 768, // KEPLER (RoBERTa-base)
+            Self::BgeM3Dense => 1024, // BGE-M3 dense head (XLM-RoBERTa-Large)
+        }
+    }
+
+    /// Returns the projected dimension used after normalization (for multi-array storage input).
+    ///
+    /// All models are normalized to these dimensions before concatenation:
+    /// - Most models: native dimension (no projection needed)
+    /// - Sparse: 1536 (projected from 30K sparse)
+    /// - Hdc: 1024 (projected from 10K-bit)
+    /// - LateInteraction: pooled to single 128D vector
+    /// - Splade: 30K sparse -> 1536D projected
+    #[must_use]
+    pub const fn projected_dimension(&self) -> usize {
+        match self {
+            Self::Sparse => 1536,     // 30K -> 1536 via learned projection
+            Self::Hdc => 1024,        // 10K-bit -> 1024 via projection
+            Self::Splade => 1536,     // 30K -> 1536 via learned projection (same as E6)
+            Self::Kepler => 768,      // No projection needed
+            Self::BgeM3Dense => 1024, // No projection needed (native 1024D dense head)
+            _ => self.dimension(),    // No projection needed (Code is now native 1536D)
+        }
+    }
+
+    /// Returns true if this model requires custom implementation (no pretrained weights).
+    #[must_use]
+    pub const fn is_custom(&self) -> bool {
+        matches!(
+            self,
+            Self::TemporalRecent | Self::TemporalPeriodic | Self::TemporalPositional | Self::Hdc
+        )
+    }
+
+    /// Returns true if this model uses pretrained weights from HuggingFace.
+    #[must_use]
+    pub const fn is_pretrained(&self) -> bool {
+        !self.is_custom()
+    }
+
+    /// Returns the maximum input token count for this model.
+    ///
+    /// # Returns
+    /// - Code embedder: 32768 tokens (extended context)
+    /// - Causal (nomic-embed): 512 tokens (capped from 8192 for causal use)
+    /// - Multimodal (e5-base-v2): 512 tokens (BERT tokenizer)
+    /// - Most others: 512 tokens
+    /// - Custom models: effectively unlimited (no tokenization)
+    #[must_use]
+    pub const fn max_tokens(&self) -> usize {
+        match self {
+            Self::Code => 32768,     // Code embedder supports 32K context
+            Self::Causal => 512,     // nomic-embed-text-v1.5 (capped from 8192)
+            Self::Contextual => 512, // EMB-1 FIX: e5-base-v2 uses BERT tokenizer (512), not CLIP (77)
+            Self::TemporalRecent
+            | Self::TemporalPeriodic
+            | Self::TemporalPositional
+            | Self::Hdc => usize::MAX, // Custom models: no token limit
+            Self::Splade => 512,     // SPLADE v3 uses BERT tokenizer limit
+            Self::Kepler => 512,     // KEPLER uses RoBERTa tokenizer limit
+            Self::BgeM3Dense => 8192, // BGE-M3 supports up to 8192 tokens
+            _ => 512,                // Standard BERT-family limit
+        }
+    }
+
+    /// Returns the tokenizer family for shared tokenizer caching.
+    ///
+    /// Models using the same tokenizer family can share tokenization results.
+    /// See M03-L29 (TokenizationManager) for usage.
+    #[must_use]
+    pub const fn tokenizer_family(&self) -> TokenizerFamily {
+        match self {
+            Self::Semantic => TokenizerFamily::BertWordpiece, // e5 uses BERT tokenizer
+            Self::Causal => TokenizerFamily::BertWordpiece,   // nomic-embed uses BERT tokenizer
+            Self::Sparse => TokenizerFamily::BertWordpiece,   // SPLADE uses BERT
+            Self::Code => TokenizerFamily::BertWordpiece, // Code embedder loads its own tokenizer; enum maps it to BertWordpiece for simplicity.
+            Self::Graph => TokenizerFamily::BertWordpiece, // MiniLM uses BERT
+            Self::Contextual => TokenizerFamily::BertWordpiece, // EMB-1 FIX: e5-base-v2 uses BERT, not CLIP
+            Self::Entity => TokenizerFamily::BertWordpiece,     // all-MiniLM uses BERT
+            Self::Kepler => TokenizerFamily::RobertaBpe,        // KEPLER uses RoBERTa/GPT-2 BPE
+            Self::LateInteraction => TokenizerFamily::BertWordpiece, // ColBERT uses BERT
+            Self::Splade => TokenizerFamily::BertWordpiece,     // SPLADE v3 uses BERT
+            Self::BgeM3Dense => TokenizerFamily::XlmRobertaSentencePiece, // BGE-M3 uses XLM-RoBERTa SentencePiece
+            Self::TemporalRecent
+            | Self::TemporalPeriodic
+            | Self::TemporalPositional
+            | Self::Hdc => TokenizerFamily::None, // Custom: no tokenizer
+        }
+    }
+
+    /// Returns all 15 model variants in pipeline order.
+    ///
+    /// Order matches the E1-E14 specification in constitution.yaml,
+    /// plus Kepler (production E11 replacement for legacy Entity).
+    ///
+    /// **NOTE**: This returns 15 variants because both `Entity` (legacy 384D MiniLM)
+    /// and `Kepler` (production 768D RoBERTa+TransE) occupy the E11 weight slot.
+    /// Use [`ModelId::production()`] for the 14 production models (excludes legacy `Entity`).
+    /// Use `NUM_EMBEDDERS` (= 14) for array sizing, NOT `ModelId::all().len()` (= 15).
+    #[must_use]
+    pub const fn all() -> &'static [ModelId] {
+        &[
+            Self::Semantic,           // E1
+            Self::TemporalRecent,     // E2
+            Self::TemporalPeriodic,   // E3
+            Self::TemporalPositional, // E4
+            Self::Causal,             // E5
+            Self::Sparse,             // E6
+            Self::Code,               // E7
+            Self::Graph,              // E8
+            Self::Hdc,                // E9
+            Self::Contextual,         // E10
+            Self::Entity,             // E11 (legacy 384D)
+            Self::LateInteraction,    // E12
+            Self::Splade,             // E13
+            Self::Kepler,             // E11 production (768D KEPLER)
+            Self::BgeM3Dense,         // E14 (BGE-M3 dense head, 1024D)
+        ]
+    }
+
+    /// Returns the 14 production model variants (excludes legacy `Entity`).
+    ///
+    /// `Entity` (384D MiniLM) is the deprecated E11 variant, replaced by `Kepler`
+    /// (768D RoBERTa+TransE). This method returns exactly `NUM_EMBEDDERS` (14)
+    /// models, which is the correct count for array sizing, weight vectors,
+    /// and iteration over active production models.
+    ///
+    /// # Difference from `all()`
+    ///
+    /// | Method | Count | Includes Entity | Includes Kepler |
+    /// |--------|-------|-----------------|-----------------|
+    /// | `all()` | 15 | Yes (legacy) | Yes |
+    /// | `production()` | 14 | No | Yes |
+    #[must_use]
+    pub const fn production() -> &'static [ModelId] {
+        &[
+            Self::Semantic,           // E1
+            Self::TemporalRecent,     // E2
+            Self::TemporalPeriodic,   // E3
+            Self::TemporalPositional, // E4
+            Self::Causal,             // E5
+            Self::Sparse,             // E6
+            Self::Code,               // E7
+            Self::Graph,              // E8
+            Self::Hdc,                // E9
+            Self::Contextual,         // E10
+            Self::Kepler,             // E11 production (768D KEPLER)
+            Self::LateInteraction,    // E12
+            Self::Splade,             // E13
+            Self::BgeM3Dense,         // E14 (BGE-M3 dense head, 1024D)
+        ]
+    }
+
+    /// Returns only pretrained models (require weight loading).
+    #[must_use = "this returns an iterator that must be consumed"]
+    pub fn pretrained() -> impl Iterator<Item = ModelId> {
+        Self::all().iter().copied().filter(|m| m.is_pretrained())
+    }
+
+    /// Returns only custom models (require implementation, no weights).
+    #[must_use = "this returns an iterator that must be consumed"]
+    pub fn custom() -> impl Iterator<Item = ModelId> {
+        Self::all().iter().copied().filter(|m| m.is_custom())
+    }
+
+    /// Latency budget in milliseconds from constitution.yaml.
+    #[must_use]
+    pub const fn latency_budget_ms(&self) -> u32 {
+        match self {
+            Self::Semantic => 5,
+            Self::TemporalRecent | Self::TemporalPeriodic | Self::TemporalPositional => 2,
+            Self::Causal => 8,
+            Self::Sparse => 3,
+            Self::Code => 10,
+            Self::Graph => 5,
+            Self::Hdc => 1,
+            Self::Contextual => 15,
+            Self::Entity => 2,
+            Self::Kepler => 5, // Slightly slower than Entity due to larger model
+            Self::LateInteraction => 8,
+            Self::Splade => 3,      // Similar to E6 Sparse
+            Self::BgeM3Dense => 50, // BGE-M3 on 8k context ~3x slower than e5-large-v2 (15ms)
+        }
+    }
+
+    /// Returns the string representation of the model ID for configuration.
+    ///
+    /// These names are used in config files (e.g., `preload_models = ["semantic", "code"]`).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::TemporalRecent => "temporal_recent",
+            Self::TemporalPeriodic => "temporal_periodic",
+            Self::TemporalPositional => "temporal_positional",
+            Self::Causal => "causal",
+            Self::Sparse => "sparse",
+            Self::Code => "code",
+            Self::Graph => "graph",
+            Self::Hdc => "hdc",
+            Self::Contextual => "contextual",
+            Self::Entity => "entity",
+            Self::Kepler => "kepler",
+            Self::LateInteraction => "late_interaction",
+            Self::Splade => "splade",
+            Self::BgeM3Dense => "bge_m3_dense",
+        }
+    }
+}

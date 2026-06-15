@@ -1,0 +1,12 @@
+# Active per-cell ship-gate exemptions. Keep entries only for operator-approved
+# degenerate cells with source-of-truth evidence and an alternate gate contract.
+
+[[exemptions]]
+cell = "delete_test_call::python"
+reason = "Reclassified under #532 degenerate all-fail contract by #810 after prodhost #808 outcomes: 32 resolved / 9079 unresolved / 0 command failures across 9111 rows, sha256:4b74dbc45d5df274659af4d3169a92c6bd812f5aa43d4051d4febc3811f86d6d. Pearson/regeneration is structurally invalid at 0.35% pass rate; new delete_test_call oracle-regeneration batches are halted."
+operator_id = "github-issue-810"
+
+[[exemptions]]
+cell = "over_engineer::python"
+reason = "#866 operator decision (c): degenerate near-constant cell. Across #849/#864/#865 measurements (2026-06-12) over_engineer passes at 0.983 under both v1 and v2 labels, H(y)=0.105 bits within cell — predicting 'pass' always is ~98% accurate, so within-cell MI/correlation is structurally bounded near zero for ANY feature set. Behavior-preserving bloat legitimately passes tests (correct oracle behavior), and its handful of Fail labels sit inside the #845 flakiness/validity band. Contract for this cell is calibration-only (predict pass with high confidence); excluded from the per-cell >=0.95 correlation denominator to prevent a vacuous gate pass. Brier/ECE on this cell still count under the calibration contract."
+operator_id = "github-issue-866"

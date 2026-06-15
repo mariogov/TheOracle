@@ -1,0 +1,30 @@
+[package]
+name = "context-graph-mejepa-corpus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Clean-room ME-JEPA-Code mutation corpus generator (Phase 0 mutation operators) for ContextGraph"
+license.workspace = true
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+context-graph-mejepa-instruments = { path = "../context-graph-mejepa-instruments" }
+context-graph-mejepa-cf = { path = "../context-graph-mejepa-cf" }
+context-graph-core = { path = "../context-graph-core" }
+context-graph-paths = { path = "../context-graph-paths" }
+ctrlc = { version = "3.5", features = ["termination"] }
+fs2 = "0.4"
+num_cpus = "1.16"
+rayon = "1.10"
+rocksdb = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+bincode = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tree-sitter = "0.26"
+tree-sitter-python = "0.23.6"
+
+[dev-dependencies]
+tempfile = "3.10"

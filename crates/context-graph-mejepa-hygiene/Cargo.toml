@@ -1,0 +1,29 @@
+[package]
+name = "context-graph-mejepa-hygiene"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ME-JEPA Phase 6 storage hygiene, quota, GC, and witness compression"
+license.workspace = true
+
+[dependencies]
+bincode = { workspace = true }
+chrono = { workspace = true }
+context-graph-mejepa-cf = { path = "../context-graph-mejepa-cf" }
+context-graph-tier-compression = { path = "../context-graph-tier-compression" }
+context-graph-witness = { path = "../context-graph-witness" }
+dashmap = "5.5"
+fs2 = "0.4"
+hex = "0.4"
+parking_lot = "0.12"
+rocksdb = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = "3.10"

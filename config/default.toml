@@ -1,0 +1,76 @@
+# Context Graph Default Configuration
+# Phase 0: Ghost System
+
+[general]
+# Development phase: "ghost", "skeleton", "muscle", "nervous", "conscious"
+phase = "ghost"
+# Logging level: "trace", "debug", "info", "warn", "error"
+log_level = "info"
+
+[server]
+# Transport: "stdio", "tcp"
+transport = "stdio"
+# TCP port (only used when transport = "tcp")
+tcp_port = 8080
+
+[storage]
+# Storage backend: "rocksdb", "sqlite", "postgres"
+backend = "rocksdb"
+# RocksDB path (durable source of truth)
+path = "/var/lib/contextgraph/storage/contextgraph-rocksdb"
+# SQLite database path (only used when backend = "sqlite")
+sqlite_path = "/var/lib/contextgraph/storage/context-graph.db"
+# PostgreSQL connection string (only used when backend = "postgres")
+# postgres_url = "postgres://user:pass@localhost/contextgraph"
+
+[embeddings]
+# Embedding provider: "stub", "local", "openai"
+provider = "stub"
+# Local model path (only used when provider = "local")
+# model_path = "models/all-MiniLM-L6-v2"
+
+[cuda]
+# Target device ID
+device_id = 0
+
+[utl]
+# Consolidation threshold for memory nodes
+consolidation_threshold = 0.7
+
+[graph]
+# Maximum edges per node
+max_edges_per_node = 100
+# Default edge weight
+default_edge_weight = 0.5
+
+[watcher]
+# Enable file watcher for directory monitoring
+# When enabled, the MCP server monitors for file changes and indexes them
+# as memories with MDFileChunk or RsFileChunk source metadata.
+enabled = true
+# Directories to watch (recursive)
+watch_paths = ["./docs"]
+# Session ID for captured memories
+session_id = "docs-watcher"
+# File extensions to watch for
+# Supported: md (markdown), rs (Rust code)
+extensions = ["md"]
+
+[watcher.code]
+# Enable code file watching (Rust .rs files)
+# When enabled, uses AST-based chunking for semantic code chunks
+enabled = false
+# Directories to watch for code files (recursive)
+watch_paths = ["./crates"]
+# Session ID for code memories
+session_id = "code-watcher"
+# File extensions for code files
+extensions = ["rs"]
+# Use AST-based chunking (true) or line-based chunking (false)
+use_ast_chunker = true
+# Target chunk size in non-whitespace characters (per cAST paper)
+target_chunk_size = 500
+# Minimum chunk size before merging with siblings
+min_chunk_size = 100
+# Maximum chunk size before recursive splitting
+max_chunk_size = 1000

@@ -1,0 +1,23 @@
+[package]
+name = "context-graph-test-utils"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared test utilities — deterministic-by-shape, random-by-content. NOT a substitute for a real embedder."
+
+[dependencies]
+# Core types (SemanticFingerprint, TeleologicalFingerprint, SparseVector)
+context-graph-core = { path = "../context-graph-core" }
+
+# Storage (RocksDbTeleologicalStore)
+context-graph-storage = { path = "../context-graph-storage" }
+
+# Data generation
+rand = { workspace = true }
+
+# Temp directories for RocksDB
+tempfile = "3"
+
+# UUIDs for fingerprint IDs
+uuid = { workspace = true }

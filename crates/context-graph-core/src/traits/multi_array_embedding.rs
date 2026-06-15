@@ -1,0 +1,1619 @@
+//! Multi-Array Embedding Provider for 13-embedding SemanticFingerprint generation.
+//!
+//! This module defines the [`MultiArrayEmbeddingProvider`] trait that orchestrates
+//! 13 individual embedders to produce a complete [`SemanticFingerprint`].
+//!
+//! # Design Philosophy
+//!
+//! **NO FUSION** - Each embedding space is preserved independently for:
+//! 1. Per-space HNSW search (13 independent indexes)
+//! 2. Per-space confidence classification
+//! 3. Full information preservation (~46KB vs ~6KB fused)
+//! 4. Auditability - trace which embedder contributed to ranking
+//!
+//! # Architecture
+//!
+//! ```text
+//! MultiArrayEmbeddingProvider
+//!     |-- calls 10 dense SingleEmbedder instances (E1-E5, E7-E11)
+//!     |-- calls 2 SparseEmbedder instances (E6, E13 - SPLADE)
+//!     |-- calls TokenEmbedder for E12 (ColBERT late-interaction)
+//!
+//!     Returns: SemanticFingerprint with all 13 embeddings
+//! ```
+//!
+//! # Performance Targets (from constitution.yaml)
+//!
+//! - Single content embedding: <30ms for all 13 embeddings
+//! - Batch embedding (64 items): <100ms total per item
+//!
+//! # 5-Stage Pipeline Integration
+//!
+//! - **Stage 1**: E13 SPLADE for initial recall (sparse retrieval)
+//! - **Stage 2**: E1 Matryoshka 128D for fast dense filtering
+//! - **Stage 3**: Full E1-E12 dense embeddings for precision
+//! - **Stage 4**: E12 ColBERT for late interaction reranking
+//! - **Stage 5**: Purpose vector from teleological computation
+//!
+//! # Example
+//!
+//! ```ignore
+//! use context_graph_core::traits::{MultiArrayEmbeddingProvider, MultiArrayEmbeddingOutput};
+//!
+//! async fn generate_fingerprint<P: MultiArrayEmbeddingProvider>(
+//!     provider: &P,
+//!     content: &str,
+//! ) -> MultiArrayEmbeddingOutput {
+//!     let output = provider.embed_all(content).await.unwrap();
+//!
+//!     // Check performance
+//!     assert!(output.is_within_latency_target());
+//!
+//!     // Access Stage 2 fast-filter embedding
+//!     let e1_128 = output.e1_matryoshka_128();
+//!     assert_eq!(e1_128.len(), 128);
+//!
+//!     output
+//! }
+//! ```
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use std::time::Duration;
+
+use crate::error::{CoreError, CoreResult};
+use crate::types::fingerprint::{SemanticFingerprint, SparseVector, NUM_EMBEDDERS};
+
+/// Output from multi-array embedding generation.
+///
+/// Contains the complete 13-embedding fingerprint plus performance metrics
+/// for monitoring and optimization.
+///
+/// # Fields
+///
+/// - `fingerprint`: Complete 13-embedding [`SemanticFingerprint`] (E1-E13)
+/// - `total_latency`: Wall-clock time for all 13 embeddings
+/// - `per_embedder_latency`: Individual latency for each embedder (index 0 = E1)
+/// - `model_ids`: Model identifiers used for each embedder slot
+///
+/// # Performance Monitoring
+///
+/// Use [`is_within_latency_target()`](Self::is_within_latency_target) to check
+/// if the embedding met the 30ms performance target, and
+/// [`slowest_embedder()`](Self::slowest_embedder) to identify optimization targets.
+#[derive(Debug, Clone)]
+pub struct MultiArrayEmbeddingOutput {
+    /// Complete 13-embedding fingerprint (E1-E13).
+    ///
+    /// Contains all dense, sparse, and token-level embeddings
+    /// without any fusion - each space preserved independently.
+    pub fingerprint: SemanticFingerprint,
+
+    /// Total wall-clock latency for generating all 13 embeddings.
+    ///
+    /// This includes parallel execution time and any coordination overhead.
+    /// Target: <30ms (from constitution.yaml)
+    pub total_latency: Duration,
+
+    /// Per-embedder latencies for performance optimization.
+    ///
+    /// Index mapping:
+    /// - 0: E1 Semantic (e5-large-v2)
+    /// - 1: E2 Temporal-Recent
+    /// - 2: E3 Temporal-Periodic
+    /// - 3: E4 Temporal-Positional
+    /// - 4: E5 Causal (Longformer)
+    /// - 5: E6 Sparse (SPLADE)
+    /// - 6: E7 Code (Qodo-Embed-1-1.5B)
+    /// - 7: E8 Graph (MiniLM)
+    /// - 8: E9 HDC
+    /// - 9: E10 Multimodal (CLIP)
+    /// - 10: E11 Entity (MiniLM)
+    /// - 11: E12 Late-Interaction (ColBERT)
+    /// - 12: E13 SPLADE v3
+    pub per_embedder_latency: [Duration; NUM_EMBEDDERS],
+
+    /// Model IDs used for each embedder slot.
+    ///
+    /// Useful for tracking which models generated embeddings
+    /// and ensuring version consistency.
+    pub model_ids: [String; NUM_EMBEDDERS],
+
+    /// Provenance from LLM-guided E5 marker detection (if hint was applied).
+    pub e5_hint_provenance: Option<EmbeddingHintProvenance>,
+}
+
+impl MultiArrayEmbeddingOutput {
+    /// Performance target: <30ms for all 13 embeddings.
+    ///
+    /// This target is derived from constitution.yaml requirements
+    /// for real-time embedding generation.
+    pub const TARGET_LATENCY_MS: u64 = 30;
+
+    /// Check if total latency is within the 30ms target.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `total_latency < 30ms`, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if output.is_within_latency_target() {
+    ///     log::info!("Embedding generated within performance budget");
+    /// } else {
+    ///     log::warn!("Embedding exceeded 30ms target: {:?}", output.total_latency);
+    /// }
+    /// ```
+    #[inline]
+    pub fn is_within_latency_target(&self) -> bool {
+        self.total_latency.as_millis() < Self::TARGET_LATENCY_MS as u128
+    }
+
+    /// Get E1 Matryoshka embedding truncated to 128D for Stage 2 fast filtering.
+    ///
+    /// Matryoshka embeddings are trained to be meaningful at multiple
+    /// truncation points. The 128D prefix provides a fast approximation
+    /// for initial candidate filtering before full similarity computation.
+    ///
+    /// # Returns
+    ///
+    /// A slice of the first 128 dimensions of the E1 semantic embedding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if E1 embedding has fewer than 128 dimensions (should never
+    /// happen with correctly initialized fingerprint - E1 is always 1024D).
+    #[inline]
+    pub fn e1_matryoshka_128(&self) -> &[f32] {
+        &self.fingerprint.e1_semantic[..128]
+    }
+
+    /// Get the slowest embedder for optimization targeting.
+    ///
+    /// Identifies the embedder with the highest latency, which is
+    /// typically the bottleneck for overall performance.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(embedder_index, latency)` where `embedder_index`
+    /// corresponds to E1 (0) through E13 (12).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (idx, latency) = output.slowest_embedder();
+    /// let name = SemanticFingerprint::embedding_name(idx).unwrap();
+    /// log::info!("Bottleneck: {} took {:?}", name, latency);
+    /// ```
+    pub fn slowest_embedder(&self) -> (usize, Duration) {
+        self.per_embedder_latency
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, d)| *d)
+            .map(|(i, d)| (i, *d))
+            .unwrap_or((0, Duration::ZERO))
+    }
+
+    /// Get the fastest embedder.
+    ///
+    /// Useful for understanding the performance distribution across embedders.
+    pub fn fastest_embedder(&self) -> (usize, Duration) {
+        self.per_embedder_latency
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, d)| *d)
+            .map(|(i, d)| (i, *d))
+            .unwrap_or((0, Duration::ZERO))
+    }
+
+    /// Calculate average latency across all embedders.
+    pub fn average_embedder_latency(&self) -> Duration {
+        let total_nanos: u128 = self.per_embedder_latency.iter().map(|d| d.as_nanos()).sum();
+        Duration::from_nanos((total_nanos / NUM_EMBEDDERS as u128) as u64)
+    }
+}
+
+// ============================================================================
+// CAUSAL HINTS FOR E5 EMBEDDING ENHANCEMENT
+// ============================================================================
+
+/// Direction hint from LLM single-text analysis.
+///
+/// Used to bias E5 (V_causality) embeddings based on whether content
+/// primarily describes causes, effects, or neutral causal content.
+///
+/// # Direction Modifiers (Applied to E5 Embedding)
+///
+/// - `Cause`: Boosts cause embedding (1.3x), dampens effect (0.8x)
+/// - `Effect`: Boosts effect embedding (1.3x), dampens cause (0.8x)
+/// - `Neutral`: No bias applied (1.0x for both)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalDirectionHint {
+    /// Text describes something that causes other things.
+    Cause,
+    /// Text describes something that is an effect.
+    Effect,
+    /// Causal content but no clear direction bias.
+    #[default]
+    Neutral,
+}
+
+impl CausalDirectionHint {
+    /// Parse direction from string.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "cause" | "causes" | "causal" => Self::Cause,
+            "effect" | "effects" | "result" | "outcome" => Self::Effect,
+            _ => Self::Neutral,
+        }
+    }
+
+    /// Get embedding bias factors (cause_bias, effect_bias).
+    pub fn bias_factors(&self) -> (f32, f32) {
+        match self {
+            Self::Cause => (1.3, 0.8),
+            Self::Effect => (0.8, 1.3),
+            Self::Neutral => (1.0, 1.0),
+        }
+    }
+}
+
+/// Legacy generated hint for E5 embedding enhancement.
+///
+/// Used at store-time to enhance E5 (V_causality) embeddings based on
+/// causal analysis of whether content describes causes or effects.
+///
+/// # Description Field
+///
+/// When confidence >= 0.5, the legacy generator produced a description
+/// explaining the causal relationship. This description is:
+/// - Embedded separately using E1 (1024D) for semantic search
+/// - Stored in CF_CAUSAL_RELATIONSHIPS with provenance
+/// - Used for "apples-to-apples" comparison of causal content
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CausalHint {
+    /// Whether content contains causal language.
+    pub is_causal: bool,
+    /// Direction bias for this content.
+    pub direction_hint: CausalDirectionHint,
+    /// Confidence [0.0, 1.0].
+    pub confidence: f32,
+    /// Key causal phrases detected.
+    pub key_phrases: Vec<String>,
+    /// Legacy generated description of the causal relationship.
+    ///
+    /// Generated when confidence >= 0.5. Contains:
+    /// - Paragraph 1: What is the causal relationship
+    /// - Paragraph 2: Mechanism/evidence details
+    /// - Paragraph 3: Implications/context
+    ///
+    /// Used for embedding and searching causal relationships with provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Legacy identified cause entity spans in the original text.
+    /// Each span is (start_char, end_char) pointing into the content string.
+    /// Tokens overlapping these spans get MARKER_BOOST in cause-weighted pooling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cause_spans: Vec<(usize, usize)>,
+
+    /// LLM-identified effect entity spans in the original text.
+    /// Tokens overlapping these spans get MARKER_BOOST in effect-weighted pooling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_spans: Vec<(usize, usize)>,
+
+    /// Asymmetry strength [0.0-1.0]. How directional is the causal relationship?
+    /// 1.0 = strongly directional, 0.0 = bidirectional/symmetric.
+    /// Modulates the marker boost factor: effective_boost = MARKER_BOOST * (0.5 + 0.5 * asymmetry_strength)
+    #[serde(default)]
+    pub asymmetry_strength: f32,
+}
+
+impl CausalHint {
+    /// Minimum confidence threshold for hint to be useful.
+    pub const MIN_USEFUL_CONFIDENCE: f32 = 0.5;
+
+    /// Create a new causal hint.
+    pub fn new(
+        is_causal: bool,
+        direction_hint: CausalDirectionHint,
+        confidence: f32,
+        key_phrases: Vec<String>,
+    ) -> Self {
+        Self {
+            is_causal,
+            direction_hint,
+            confidence: confidence.clamp(0.0, 1.0),
+            key_phrases,
+            description: None,
+            cause_spans: Vec::new(),
+            effect_spans: Vec::new(),
+            asymmetry_strength: 0.0,
+        }
+    }
+
+    /// Create a new causal hint with description.
+    pub fn with_description(
+        is_causal: bool,
+        direction_hint: CausalDirectionHint,
+        confidence: f32,
+        key_phrases: Vec<String>,
+        description: Option<String>,
+    ) -> Self {
+        Self {
+            is_causal,
+            direction_hint,
+            confidence: confidence.clamp(0.0, 1.0),
+            key_phrases,
+            description,
+            cause_spans: Vec::new(),
+            effect_spans: Vec::new(),
+            asymmetry_strength: 0.0,
+        }
+    }
+
+    /// Create a hint indicating non-causal content.
+    pub fn not_causal() -> Self {
+        Self {
+            is_causal: false,
+            direction_hint: CausalDirectionHint::Neutral,
+            confidence: 1.0,
+            key_phrases: Vec::new(),
+            description: None,
+            cause_spans: Vec::new(),
+            effect_spans: Vec::new(),
+            asymmetry_strength: 0.0,
+        }
+    }
+
+    /// Check if this hint is useful for embedding enhancement.
+    pub fn is_useful(&self) -> bool {
+        self.is_causal && self.confidence >= Self::MIN_USEFUL_CONFIDENCE
+    }
+
+    /// Get embedding bias factors from this hint.
+    pub fn bias_factors(&self) -> (f32, f32) {
+        if self.is_useful() {
+            self.direction_hint.bias_factors()
+        } else {
+            (1.0, 1.0)
+        }
+    }
+
+    /// Convert to lightweight guidance struct for the embedder pipeline.
+    /// Returns None if the hint is not useful for guiding embeddings.
+    pub fn to_guidance(&self) -> Option<CausalHintGuidance> {
+        if !self.is_useful() {
+            return None;
+        }
+        Some(CausalHintGuidance {
+            cause_spans: self.cause_spans.clone(),
+            effect_spans: self.effect_spans.clone(),
+            key_phrases: self.key_phrases.clone(),
+            asymmetry_strength: self.asymmetry_strength,
+            confidence: self.confidence,
+        })
+    }
+}
+
+/// Legacy guidance for marker detection. Lightweight, no generated text content.
+/// Passed from CausalHint down to the embedder's marker detection pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct CausalHintGuidance {
+    /// Char offsets of cause entities in source text.
+    pub cause_spans: Vec<(usize, usize)>,
+    /// Char offsets of effect entities in source text.
+    pub effect_spans: Vec<(usize, usize)>,
+    /// Additional marker words/phrases from legacy causal analysis.
+    pub key_phrases: Vec<String>,
+    /// Asymmetry strength [0.0-1.0] from legacy causal analysis.
+    pub asymmetry_strength: f32,
+    /// Overall confidence of the legacy hint.
+    pub confidence: f32,
+}
+
+/// Provenance record for LLM-guided embedding enhancement.
+/// Tracks what the LLM contributed and how it influenced the final vectors.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingHintProvenance {
+    /// Was an LLM hint available and used?
+    pub hint_applied: bool,
+    /// LLM model that produced the hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_model: Option<String>,
+    /// Number of static markers detected (from CAUSE_INDICATORS/EFFECT_INDICATORS).
+    pub static_cause_markers: usize,
+    pub static_effect_markers: usize,
+    /// Number of LLM-guided markers injected (from key_phrases + entity spans).
+    pub llm_cause_markers: usize,
+    pub llm_effect_markers: usize,
+    /// Direction hint applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Confidence of the LLM hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_confidence: Option<f32>,
+    /// Asymmetry strength from LLM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asymmetry_strength: Option<f32>,
+    /// Effective marker boost used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_marker_boost: Option<f32>,
+    /// Timestamp of hint generation (epoch millis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_generated_at: Option<i64>,
+}
+
+// ============================================================================
+// MULTI-RELATIONSHIP EXTRACTION TYPES
+// ============================================================================
+
+/// Type of causal mechanism connecting cause and effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MechanismType {
+    /// A directly causes B without intermediaries.
+    #[default]
+    Direct,
+    /// A causes X which causes B (indirect pathway).
+    Mediated,
+    /// A and B mutually reinforce each other (feedback loops).
+    Feedback,
+    /// A precedes B in a necessary sequence.
+    Temporal,
+}
+
+impl MechanismType {
+    /// Parse from string (for LLM output parsing).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "direct" => Some(Self::Direct),
+            "mediated" => Some(Self::Mediated),
+            "feedback" => Some(Self::Feedback),
+            "temporal" => Some(Self::Temporal),
+            _ => None,
+        }
+    }
+
+    /// Convert to string for serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Mediated => "mediated",
+            Self::Feedback => "feedback",
+            Self::Temporal => "temporal",
+        }
+    }
+}
+
+/// A single causal relationship extracted from content.
+///
+/// Unlike [`CausalHint`] which describes whether text IS causal,
+/// this represents a specific cause-effect relationship found within the text.
+/// Multiple `ExtractedCausalRelationship` instances can be extracted from
+/// a single piece of content.
+///
+/// Each relationship includes an explanatory paragraph that is embedded
+/// using E5 dual vectors (as_cause and as_effect) for asymmetric search.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExtractedCausalRelationship {
+    /// Brief statement of the cause (e.g., "Chronic stress elevates cortisol")
+    pub cause: String,
+
+    /// Brief statement of the effect (e.g., "Elevated cortisol damages neurons")
+    pub effect: String,
+
+    /// 1-2 paragraph explanation of HOW and WHY this causal link exists.
+    /// This is embedded for semantic search.
+    pub explanation: String,
+
+    /// Confidence score [0.0, 1.0] from the LLM.
+    pub confidence: f32,
+
+    /// Type of causal mechanism.
+    pub mechanism_type: MechanismType,
+}
+
+impl ExtractedCausalRelationship {
+    /// Create a new extracted relationship with validation.
+    pub fn new(
+        cause: String,
+        effect: String,
+        explanation: String,
+        confidence: f32,
+        mechanism_type: MechanismType,
+    ) -> Self {
+        Self {
+            cause,
+            effect,
+            explanation,
+            confidence: confidence.clamp(0.0, 1.0),
+            mechanism_type,
+        }
+    }
+
+    /// Check if this relationship meets the minimum confidence threshold.
+    pub fn is_confident(&self, threshold: f32) -> bool {
+        self.confidence >= threshold
+    }
+}
+
+/// Result of multi-relationship extraction from a piece of content.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MultiRelationshipResult {
+    /// All causal relationships extracted from the content.
+    pub relationships: Vec<ExtractedCausalRelationship>,
+
+    /// Whether the content had any causal language at all.
+    pub has_causal_content: bool,
+}
+
+impl MultiRelationshipResult {
+    /// Create an empty result for non-causal content.
+    pub fn not_causal() -> Self {
+        Self {
+            relationships: Vec::new(),
+            has_causal_content: false,
+        }
+    }
+
+    /// Check if any relationships were found.
+    pub fn has_relationships(&self) -> bool {
+        !self.relationships.is_empty()
+    }
+
+    /// Get only relationships above a confidence threshold.
+    pub fn confident_relationships(&self, threshold: f32) -> Vec<&ExtractedCausalRelationship> {
+        self.relationships
+            .iter()
+            .filter(|r| r.is_confident(threshold))
+            .collect()
+    }
+}
+
+// ============================================================================
+// EMBEDDING METADATA
+// ============================================================================
+
+/// Metadata for temporal embedding models (E2-E4) and causal hints (E5).
+///
+/// Provides explicit context for temporal embedders rather than relying on
+/// implicit time extraction. This is particularly important for E4 (V_ordering)
+/// which should encode session sequence positions, not Unix timestamps.
+///
+/// # E4-FIX
+///
+/// This struct was added to fix E4 sequence embedding. Previously, E4 used
+/// Unix timestamps (same as E2), making it a duplicate. With this metadata,
+/// E4 now receives proper session sequence numbers.
+///
+/// # Causal Hints
+///
+/// The `causal_hint` field enables LLM-enhanced E5 embeddings by providing
+/// direction hints during memory storage.
+///
+/// # Usage
+///
+/// ```ignore
+/// let metadata = EmbeddingMetadata {
+///     session_id: Some("session-123".to_string()),
+///     session_sequence: Some(42),  // 43rd memory in this session
+///     timestamp: Some(Utc::now()),
+///     causal_hint: None,  // Optional LLM hint for E5
+/// };
+///
+/// let output = provider.embed_all_with_metadata(content, metadata).await?;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingMetadata {
+    /// Session ID for session-scoped operations.
+    ///
+    /// Used to scope sequence numbers within a session.
+    pub session_id: Option<String>,
+
+    /// Session sequence number for E4 (V_ordering).
+    ///
+    /// Monotonically increasing within a session (0, 1, 2, ...).
+    /// This is used by E4 instead of Unix timestamps to enable proper
+    /// "before/after" queries within a session.
+    pub session_sequence: Option<u64>,
+
+    /// Explicit timestamp for E2 (V_freshness) and E3 (V_periodicity).
+    ///
+    /// Required. Missing timestamps fail closed for E2/E3.
+    pub timestamp: Option<DateTime<Utc>>,
+
+    /// Optional legacy causal hint for E5 (V_causality) enhancement.
+    ///
+    /// When provided, the E5 embedder can use direction hints to generate
+    /// better cause/effect vectors. If None, falls back to marker detection.
+    pub causal_hint: Option<CausalHint>,
+}
+
+impl EmbeddingMetadata {
+    /// Create metadata with session sequence (preferred for E4).
+    ///
+    /// # Arguments
+    /// * `session_id` - Session identifier
+    /// * `sequence` - Sequence number within the session
+    #[must_use]
+    pub fn with_sequence(session_id: impl Into<String>, sequence: u64) -> Self {
+        Self {
+            session_id: Some(session_id.into()),
+            session_sequence: Some(sequence),
+            timestamp: Some(Utc::now()),
+            causal_hint: None,
+        }
+    }
+
+    /// Create metadata with explicit timestamp (for backward compatibility).
+    #[must_use]
+    pub fn with_timestamp(timestamp: DateTime<Utc>) -> Self {
+        Self {
+            session_id: None,
+            session_sequence: None,
+            timestamp: Some(timestamp),
+            causal_hint: None,
+        }
+    }
+
+    /// Set a causal hint for E5 embedding enhancement.
+    ///
+    /// # Arguments
+    /// * `hint` - legacy generated causal hint
+    #[must_use]
+    pub fn with_causal_hint(mut self, hint: CausalHint) -> Self {
+        self.causal_hint = Some(hint);
+        self
+    }
+
+    /// Format E4 instruction string for hybrid session+sequence mode.
+    ///
+    /// Returns "session:X sequence:N" if both session_id and session_sequence are set,
+    /// enabling the E4 hybrid mode to generate session-specific signatures.
+    /// Missing/empty session ids or sequences fail closed. E4's production
+    /// contract is within-session ordering, so timestamp-only positions are
+    /// rejected instead of being treated as order evidence.
+    ///
+    /// # Output Examples
+    ///
+    /// - With session + sequence: `"session:abc123 sequence:42"`
+    /// # Errors
+    ///
+    /// Returns `CoreError::ValidationError` when either required field is absent
+    /// or the session id is empty/whitespace.
+    pub fn e4_instruction(&self) -> CoreResult<String> {
+        let session_id = self
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .ok_or_else(|| CoreError::ValidationError {
+                field: "metadata.session_id".to_string(),
+                message: "E4 temporal-positional requires non-empty session_id; expected session:<id> sequence:<n>".to_string(),
+            })?;
+        let seq = self
+            .session_sequence
+            .ok_or_else(|| CoreError::ValidationError {
+                field: "metadata.session_sequence".to_string(),
+                message: "E4 temporal-positional requires session_sequence; timestamp-only E4 instructions are rejected".to_string(),
+            })?;
+
+        Ok(format!("session:{session_id} sequence:{seq}"))
+    }
+
+    /// Generate instruction string for E2 (V_freshness) embedding.
+    ///
+    /// Passes the memory's creation timestamp so E2 computes a unique decay
+    /// vector per memory. Missing timestamps fail closed instead of fabricating
+    /// current-time vectors.
+    ///
+    /// Format: `"timestamp:2024-01-15T10:30:00+00:00"` or `"epoch:1705315800"`
+    /// # Errors
+    ///
+    /// Returns `CoreError::ValidationError` when `timestamp` is absent.
+    pub fn e2_instruction(&self) -> CoreResult<String> {
+        let ts = self.timestamp.ok_or_else(|| CoreError::ValidationError {
+            field: "metadata.timestamp".to_string(),
+            message: "E2 temporal-recent requires explicit timestamp; no current-time fallback is allowed".to_string(),
+        })?;
+        Ok(format!("timestamp:{}", ts.to_rfc3339()))
+    }
+
+    /// Generate instruction string for E3 (V_periodicity) embedding.
+    ///
+    /// Passes the memory's creation timestamp so E3 encodes the correct
+    /// time-of-day and day-of-week periodic patterns for this memory.
+    ///
+    /// Uses the same format as E2 since both parse timestamps identically.
+    /// # Errors
+    ///
+    /// Returns `CoreError::ValidationError` when `timestamp` is absent.
+    pub fn e3_instruction(&self) -> CoreResult<String> {
+        self.e2_instruction()
+    }
+}
+
+/// Multi-Array Embedding Provider trait.
+///
+/// Orchestrates 13 individual embedders to produce a complete [`SemanticFingerprint`].
+/// This trait REPLACES the legacy single-vector `EmbeddingProvider` for all new code.
+///
+/// # Performance Targets (from constitution.yaml)
+///
+/// - Single content: <30ms for all 13 embeddings
+/// - Batch (64 items): <100ms total per item
+///
+/// # Thread Safety
+///
+/// Requires `Send + Sync` for async task spawning across threads.
+/// Implementations should parallelize embedding generation where possible.
+///
+/// # Object Safety
+///
+/// This trait is object-safe and can be used with `dyn MultiArrayEmbeddingProvider`.
+///
+/// # Example Implementation
+///
+/// ```ignore
+/// use async_trait::async_trait;
+/// use context_graph_core::traits::{
+///     MultiArrayEmbeddingProvider, MultiArrayEmbeddingOutput
+/// };
+/// use context_graph_core::error::CoreResult;
+///
+/// struct ProductionProvider {
+///     embedders: Vec<Box<dyn SingleEmbedder>>,
+///     sparse_embedders: Vec<Box<dyn SparseEmbedder>>,
+///     token_embedder: Box<dyn TokenEmbedder>,
+/// }
+///
+/// #[async_trait]
+/// impl MultiArrayEmbeddingProvider for ProductionProvider {
+///     async fn embed_all(&self, content: &str) -> CoreResult<MultiArrayEmbeddingOutput> {
+///         // Parallel execution of all 13 embedders
+///         todo!()
+///     }
+///
+///     // ... other methods
+/// }
+/// ```
+#[async_trait]
+pub trait MultiArrayEmbeddingProvider: Send + Sync {
+    /// Generate complete 13-embedding fingerprint for content.
+    ///
+    /// Calls all 13 embedders (ideally in parallel) and combines results
+    /// into a single [`SemanticFingerprint`].
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text content to embed (must be non-empty)
+    ///
+    /// # Returns
+    ///
+    /// A [`MultiArrayEmbeddingOutput`] containing:
+    /// - Complete 13-embedding fingerprint
+    /// - Total and per-embedder latency metrics
+    /// - Model IDs used
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError` if:
+    /// - Content is empty (`CoreError::ValidationError`)
+    /// - Provider is not ready (`CoreError::Internal`)
+    /// - Any embedder fails (propagated error)
+    /// - Timeout exceeded
+    ///
+    /// # Performance
+    ///
+    /// Target latency: <30ms for all 13 embeddings (constitution.yaml)
+    async fn embed_all(&self, content: &str) -> CoreResult<MultiArrayEmbeddingOutput>;
+
+    /// Generate complete 13-embedding fingerprint with explicit metadata.
+    ///
+    /// This method allows passing explicit session sequence numbers for E4
+    /// (V_ordering) embeddings, enabling proper "before/after" queries within
+    /// a session.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text content to embed (must be non-empty)
+    /// * `metadata` - Metadata for temporal embedders (E2-E4)
+    ///
+    /// # E4-FIX
+    ///
+    /// This method was added to fix E4 sequence embedding. The default
+    /// implementation delegates to `embed_all()` for backward compatibility,
+    /// but implementations should override this to use metadata.session_sequence
+    /// for E4 embeddings.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation fails closed. Implementations must override
+    /// this method when they can propagate temporal metadata to E2/E3/E4.
+    async fn embed_all_with_metadata(
+        &self,
+        content: &str,
+        metadata: EmbeddingMetadata,
+    ) -> CoreResult<MultiArrayEmbeddingOutput> {
+        let _ = (content, metadata);
+        Err(CoreError::Internal(
+            "embed_all_with_metadata is not implemented for this provider; refusing to discard temporal metadata".to_string(),
+        ))
+    }
+
+    /// Generate fingerprints for multiple contents in batch.
+    ///
+    /// Batch processing is more efficient than individual calls,
+    /// amortizing model loading and API overhead.
+    ///
+    /// # Arguments
+    ///
+    /// * `contents` - Slice of text content to embed
+    /// * `metadata` - Slice of metadata for each content item. Length must
+    ///   equal `contents.len()` so temporal slots cannot use default metadata.
+    ///
+    /// # Returns
+    ///
+    /// A vector of [`MultiArrayEmbeddingOutput`] in the same order as input.
+    ///
+    /// # Performance Target
+    ///
+    /// 64 contents: <100ms per item average
+    async fn embed_batch_all(
+        &self,
+        contents: &[String],
+        metadata: &[EmbeddingMetadata],
+    ) -> CoreResult<Vec<MultiArrayEmbeddingOutput>>;
+
+    /// Embed content using only E1 (semantic) embedder.
+    ///
+    /// Efficient for cases where only E1 embedding is needed, avoiding
+    /// the overhead of generating all 13 embeddings.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text to embed
+    ///
+    /// # Returns
+    ///
+    /// E1 embedding as 1024D vector.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `embed_all` and extracts E1 (wasteful but correct).
+    /// Implementations should override for efficiency.
+    async fn embed_e1_only(&self, content: &str) -> CoreResult<Vec<f32>> {
+        let output = self.embed_all(content).await?;
+        Ok(output.fingerprint.e1_semantic)
+    }
+
+    /// Embed content using only E5 (causal) embedder to get dual vectors.
+    ///
+    /// Returns (as_cause, as_effect) E5 dual embeddings (768D each).
+    /// Used for storing CausalRelationship with E5 asymmetric search capability.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text to embed (typically a causal explanation paragraph)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (e5_as_cause, e5_as_effect) vectors, each 768D.
+    ///
+    /// # Default Implementation
+    ///
+    /// E5 is retired/inactive in the current ME-JEPA stack, so the default
+    /// implementation fails closed. Implementations that deliberately re-enable
+    /// E5 must override this method and provide real dual vectors.
+    async fn embed_e5_dual(&self, content: &str) -> CoreResult<(Vec<f32>, Vec<f32>)> {
+        let _ = content;
+        Err(CoreError::Internal(
+            "E5 causal embedder is retired and disabled; ME-JEPA/retrieval must use active embedders instead"
+                .to_string(),
+        ))
+    }
+
+    /// Embed content using only E8 (graph) embedder to get dual vectors.
+    ///
+    /// Returns (as_source, as_target) E8 dual embeddings (1024D each).
+    /// Used for graph structure search in causal relationships.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text to embed (typically a causal relationship description)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (e8_as_source, e8_as_target) vectors, each 1024D.
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `embed_all` and extracts E8 dual vectors.
+    /// Implementations should override for efficiency.
+    async fn embed_e8_dual(&self, content: &str) -> CoreResult<(Vec<f32>, Vec<f32>)> {
+        let output = self.embed_all(content).await?;
+        Ok((
+            output.fingerprint.e8_graph_as_source,
+            output.fingerprint.e8_graph_as_target,
+        ))
+    }
+
+    /// Embed content using only E11 (entity/KEPLER) embedder.
+    ///
+    /// Returns E11 entity embedding (768D).
+    /// Used for entity-based search with TransE operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text to embed
+    ///
+    /// # Returns
+    ///
+    /// E11 entity vector (768D).
+    ///
+    /// # Default Implementation
+    ///
+    /// Falls back to `embed_all` and extracts E11.
+    /// Implementations should override for efficiency.
+    async fn embed_e11_only(&self, content: &str) -> CoreResult<Vec<f32>> {
+        let output = self.embed_all(content).await?;
+        Ok(output.fingerprint.e11_entity)
+    }
+
+    /// Get expected dimensions for each embedder.
+    ///
+    /// Returns array where index matches embedder number:
+    /// - 0: E1 (1024D semantic)
+    /// - 1: E2 (512D temporal-recent)
+    /// - ...
+    /// - 5: E6 (0 - sparse variable)
+    /// - ...
+    /// - 11: E12 (128D per token)
+    /// - 12: E13 (0 - sparse variable)
+    ///
+    /// Sparse embedders (E6, E13) return 0 since dimension is variable.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns the standard dimensions from the teleological architecture spec.
+    fn dimensions(&self) -> [usize; NUM_EMBEDDERS] {
+        [
+            1024, // E1: Semantic (e5-large-v2)
+            512,  // E2: Temporal-Recent
+            512,  // E3: Temporal-Periodic
+            512,  // E4: Temporal-Positional
+            0,    // E5: retired/disabled (kept as an addressable legacy slot)
+            0,    // E6: Sparse (SPLADE) - variable
+            1536, // E7: Code (Qodo-Embed-1-1.5B)
+            1024, // E8: Graph (e5-large-v2, upgraded from MiniLM 384D)
+            1024, // E9: HDC (projected)
+            768,  // E10: Multimodal (CLIP)
+            768,  // E11: Entity (KEPLER)
+            128,  // E12: Late-Interaction (ColBERT per-token)
+            0,    // E13: SPLADE v3 - variable
+            1024, // E14: BGE-M3 Dense
+        ]
+    }
+
+    /// Get model IDs for each embedder slot.
+    ///
+    /// Used for tracking which models generated embeddings
+    /// and ensuring version consistency across sessions.
+    fn model_ids(&self) -> [&str; NUM_EMBEDDERS];
+
+    /// Check if all 13 embedders are initialized and ready.
+    ///
+    /// # Returns
+    ///
+    /// `true` if all embedders have loaded their models and are
+    /// ready to accept embedding requests.
+    fn is_ready(&self) -> bool;
+
+    /// Get health status for each embedder.
+    ///
+    /// Index mapping matches `dimensions()`:
+    /// - 0: E1, 1: E2, ..., 12: E13
+    ///
+    /// # Returns
+    ///
+    /// Array of booleans indicating health status for each embedder.
+    fn health_status(&self) -> [bool; NUM_EMBEDDERS];
+}
+
+/// Individual dense embedder trait for composition.
+///
+/// Wraps a single embedding model for use in [`MultiArrayEmbeddingProvider`].
+/// Used for E1-E5, E7-E11 (10 dense embedders).
+///
+/// # Thread Safety
+///
+/// Requires `Send + Sync` for use in async contexts with work-stealing executors.
+///
+/// # Object Safety
+///
+/// This trait is object-safe and can be used with `dyn SingleEmbedder`.
+///
+/// # Example
+///
+/// ```ignore
+/// struct NomicEmbedder {
+///     model: Model,
+///     dimension: usize,
+/// }
+///
+/// #[async_trait]
+/// impl SingleEmbedder for NomicEmbedder {
+///     fn dimension(&self) -> usize { self.dimension }
+///     fn model_id(&self) -> &str { "nomic-embed-v1.5" }
+///     async fn embed(&self, content: &str) -> CoreResult<Vec<f32>> {
+///         self.model.encode(content).await
+///     }
+///     fn is_ready(&self) -> bool { self.model.is_loaded() }
+/// }
+/// ```
+#[async_trait]
+pub trait SingleEmbedder: Send + Sync {
+    /// Fixed embedding dimension for this model.
+    ///
+    /// All embeddings from this embedder will have exactly this dimension.
+    fn dimension(&self) -> usize;
+
+    /// Model identifier (e.g., "nomic-embed-v1.5", "e5-large-v2").
+    ///
+    /// Used for tracking and version consistency.
+    fn model_id(&self) -> &str;
+
+    /// Generate dense embedding vector.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text content to embed
+    ///
+    /// # Returns
+    ///
+    /// A dense f32 vector with length equal to `dimension()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError` if:
+    /// - Content is empty
+    /// - Model is not ready
+    /// - Encoding fails
+    async fn embed(&self, content: &str) -> CoreResult<Vec<f32>>;
+
+    /// Generate dense embedding with an optional instruction hint.
+    ///
+    /// Used by temporal embedders (E2/E3/E4) to receive timestamp/sequence
+    /// information via the instruction field. Non-temporal embedders can
+    /// ignore the instruction and delegate to `embed(content)`.
+    async fn embed_with_instruction(
+        &self,
+        content: &str,
+        instruction: Option<&str>,
+    ) -> CoreResult<Vec<f32>> {
+        let _ = instruction;
+        self.embed(content).await
+    }
+
+    /// Check if model is loaded and ready.
+    fn is_ready(&self) -> bool;
+}
+
+/// Sparse embedder trait for SPLADE-style embeddings.
+///
+/// Used for E6 (general sparse) and E13 (SPLADE v3 for Stage 1 recall).
+/// Produces sparse vectors with vocabulary indices and activation values.
+///
+/// # Sparse Vector Format
+///
+/// Returns [`SparseVector`] with:
+/// - `indices`: Sorted vocabulary indices (u16, max 30522)
+/// - `values`: Activation values (f32) for each index
+///
+/// Typical sparsity: ~5% of vocabulary (1500 active indices).
+///
+/// # Thread Safety
+///
+/// Requires `Send + Sync` for async contexts.
+///
+/// # Object Safety
+///
+/// This trait is object-safe and can be used with `dyn SparseEmbedder`.
+#[async_trait]
+pub trait SparseEmbedder: Send + Sync {
+    /// Vocabulary size for sparse vector indices.
+    ///
+    /// Standard SPLADE uses BERT vocabulary: 30,522 tokens.
+    fn vocab_size(&self) -> usize;
+
+    /// Model identifier (e.g., "splade-v3-doc", "splade-cocondenser").
+    fn model_id(&self) -> &str;
+
+    /// Generate sparse embedding with indices and values.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text content to embed
+    ///
+    /// # Returns
+    ///
+    /// A [`SparseVector`] with sorted indices and corresponding values.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError` if:
+    /// - Content is empty
+    /// - Model is not ready
+    /// - Encoding fails
+    async fn embed_sparse(&self, content: &str) -> CoreResult<SparseVector>;
+
+    /// Check if model is loaded and ready.
+    fn is_ready(&self) -> bool;
+}
+
+/// Token-level embedder trait for ColBERT-style embeddings.
+///
+/// Used for E12 - produces per-token embeddings for late interaction scoring.
+/// Late interaction allows fine-grained matching between query and document tokens.
+///
+/// # ColBERT Architecture
+///
+/// ColBERT generates 128D embeddings for each token, enabling MaxSim scoring:
+/// ```text
+/// score = sum(max(q_i . d_j)) for all query tokens i
+/// ```
+///
+/// # Thread Safety
+///
+/// Requires `Send + Sync` for async contexts.
+///
+/// # Object Safety
+///
+/// This trait is object-safe and can be used with `dyn TokenEmbedder`.
+#[async_trait]
+pub trait TokenEmbedder: Send + Sync {
+    /// Dimension per token (E12 = 128D).
+    ///
+    /// Each token embedding will have exactly this dimension.
+    fn token_dimension(&self) -> usize;
+
+    /// Maximum tokens supported.
+    ///
+    /// Content will be truncated if it exceeds this limit.
+    /// Typical values: 512 (BERT-base) or 256 (efficiency mode).
+    fn max_tokens(&self) -> usize;
+
+    /// Model identifier (e.g., "colbert-v2", "colbertv2.0").
+    fn model_id(&self) -> &str;
+
+    /// Generate per-token embeddings.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - Text content to tokenize and embed
+    ///
+    /// # Returns
+    ///
+    /// A vector of token embeddings, where each inner vector has
+    /// length equal to `token_dimension()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError` if:
+    /// - Content is empty
+    /// - Model is not ready
+    /// - Tokenization or encoding fails
+    async fn embed_tokens(&self, content: &str) -> CoreResult<Vec<Vec<f32>>>;
+
+    /// Check if model is loaded and ready.
+    fn is_ready(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that latency target check works correctly for passing case.
+    #[test]
+    fn test_multi_array_output_within_latency_target() {
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::from_millis(25), // Under 30ms
+            per_embedder_latency: [Duration::from_millis(2); NUM_EMBEDDERS],
+            model_ids: core::array::from_fn(|i| format!("model-e{}", i + 1)),
+            e5_hint_provenance: None,
+        };
+        assert!(output.is_within_latency_target());
+    }
+
+    /// Test that latency target check works correctly for exceeding case.
+    #[test]
+    fn test_multi_array_output_exceeds_latency_target() {
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::from_millis(50), // Over 30ms
+            per_embedder_latency: [Duration::from_millis(4); NUM_EMBEDDERS],
+            model_ids: core::array::from_fn(|i| format!("model-e{}", i + 1)),
+            e5_hint_provenance: None,
+        };
+        assert!(!output.is_within_latency_target());
+    }
+
+    /// Test boundary case: exactly 30ms should NOT be within target (must be less than).
+    #[test]
+    fn test_multi_array_output_boundary_latency() {
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::from_millis(30), // Exactly 30ms
+            per_embedder_latency: [Duration::from_millis(2); NUM_EMBEDDERS],
+            model_ids: core::array::from_fn(|_| String::new()),
+            e5_hint_provenance: None,
+        };
+        // 30ms is NOT within target (must be strictly less than 30ms)
+        assert!(!output.is_within_latency_target());
+    }
+
+    /// Test E1 Matryoshka truncation to 128D.
+    #[test]
+    fn test_e1_matryoshka_128_truncation() {
+        let mut fp = SemanticFingerprint::zeroed();
+        // Set known values in first 128 elements
+        for i in 0..128 {
+            fp.e1_semantic[i] = i as f32;
+        }
+        // Set different values beyond 128 to ensure we're truncating
+        for i in 128..256 {
+            fp.e1_semantic[i] = 999.0;
+        }
+
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: fp,
+            total_latency: Duration::ZERO,
+            per_embedder_latency: [Duration::ZERO; NUM_EMBEDDERS],
+            model_ids: core::array::from_fn(|_| String::new()),
+            e5_hint_provenance: None,
+        };
+
+        let truncated = output.e1_matryoshka_128();
+        assert_eq!(truncated.len(), 128);
+        assert_eq!(truncated[0], 0.0);
+        assert_eq!(truncated[127], 127.0);
+        // Verify we got the first 128, not some other slice
+        assert_eq!(truncated[64], 64.0);
+    }
+
+    /// Test that dimensions() returns correct values for all 13 embedders.
+    ///
+    /// M-M3 (GH #489, 2026-05-19): SCOPE NOTE — this test exercises the
+    /// DEFAULT TRAIT METHOD `MultiArrayEmbeddingProvider::dimensions()`, which
+    /// returns a compile-time constant array of slot dimensions. It does NOT
+    /// call `embed_all` / `embed_batch_all`; those return `Err(...)` here so
+    /// any future test that accidentally invokes them fails closed instead of
+    /// silently returning fake vectors. Verdict on the original Sherlock
+    /// finding: this `MockProvider` is correctly bounded and is the doctrinal
+    /// "test double for a default trait method" — no rewrite needed.
+    #[test]
+    fn test_dimensions_returns_correct_values() {
+        use crate::error::CoreError;
+        // Test double for the default trait method `dimensions()`.
+        // `embed_all` / `embed_batch_all` deliberately return Err to fail-fast
+        // if any future test attempts to use them as a real embedder source.
+        struct MockProvider;
+
+        #[async_trait]
+        impl MultiArrayEmbeddingProvider for MockProvider {
+            async fn embed_all(&self, _: &str) -> CoreResult<MultiArrayEmbeddingOutput> {
+                Err(CoreError::Internal(
+                    "MockProvider.embed_all() is not implemented - this is a test mock".to_string(),
+                ))
+            }
+            async fn embed_batch_all(
+                &self,
+                _: &[String],
+                _: &[EmbeddingMetadata],
+            ) -> CoreResult<Vec<MultiArrayEmbeddingOutput>> {
+                Err(CoreError::Internal(
+                    "MockProvider.embed_batch_all() is not implemented - this is a test mock"
+                        .to_string(),
+                ))
+            }
+            fn model_ids(&self) -> [&str; NUM_EMBEDDERS] {
+                ["mock"; NUM_EMBEDDERS]
+            }
+            fn is_ready(&self) -> bool {
+                // MockProvider is always "ready" for testing dimensions()
+                true
+            }
+            fn health_status(&self) -> [bool; NUM_EMBEDDERS] {
+                [true; NUM_EMBEDDERS]
+            }
+        }
+
+        let dims = MockProvider.dimensions();
+
+        // Verify all expected dimensions
+        assert_eq!(dims[0], 1024, "E1 semantic should be 1024D");
+        assert_eq!(dims[1], 512, "E2 temporal-recent should be 512D");
+        assert_eq!(dims[2], 512, "E3 temporal-periodic should be 512D");
+        assert_eq!(dims[3], 512, "E4 temporal-positional should be 512D");
+        assert_eq!(dims[4], 0, "E5 causal is retired/disabled");
+        assert_eq!(dims[5], 0, "E6 sparse should be 0 (variable)");
+        assert_eq!(dims[6], 1536, "E7 code should be 1536D");
+        assert_eq!(
+            dims[7], 1024,
+            "E8 graph should be 1024D (upgraded from MiniLM)"
+        );
+        assert_eq!(dims[8], 1024, "E9 HDC should be 1024D (projected)");
+        assert_eq!(dims[9], 768, "E10 multimodal should be 768D");
+        assert_eq!(dims[10], 768, "E11 entity should be 768D (KEPLER)");
+        assert_eq!(
+            dims[11], 128,
+            "E12 late-interaction should be 128D per token"
+        );
+        assert_eq!(dims[12], 0, "E13 SPLADE should be 0 (variable)");
+    }
+
+    /// Test slowest_embedder() identification.
+    #[test]
+    fn test_slowest_embedder_identification() {
+        let mut latencies = [Duration::from_millis(1); NUM_EMBEDDERS];
+        latencies[8] = Duration::from_millis(10); // E9 HDC is slowest
+
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::from_millis(20),
+            per_embedder_latency: latencies,
+            model_ids: core::array::from_fn(|_| String::new()),
+            e5_hint_provenance: None,
+        };
+
+        let (idx, latency) = output.slowest_embedder();
+        assert_eq!(idx, 8, "E9 should be identified as slowest");
+        assert_eq!(latency, Duration::from_millis(10));
+    }
+
+    /// Test fastest_embedder() identification.
+    #[test]
+    fn test_fastest_embedder_identification() {
+        let mut latencies = [Duration::from_millis(5); NUM_EMBEDDERS];
+        latencies[6] = Duration::from_millis(1); // E7 Code is fastest
+
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::from_millis(60),
+            per_embedder_latency: latencies,
+            model_ids: core::array::from_fn(|_| String::new()),
+            e5_hint_provenance: None,
+        };
+
+        let (idx, latency) = output.fastest_embedder();
+        assert_eq!(idx, 6, "E7 should be identified as fastest");
+        assert_eq!(latency, Duration::from_millis(1));
+    }
+
+    /// Test average latency calculation.
+    #[test]
+    fn test_average_embedder_latency() {
+        let latencies = [Duration::from_millis(2); NUM_EMBEDDERS]; // All 2ms
+
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::from_millis(26),
+            per_embedder_latency: latencies,
+            model_ids: core::array::from_fn(|_| String::new()),
+            e5_hint_provenance: None,
+        };
+
+        let avg = output.average_embedder_latency();
+        assert_eq!(avg, Duration::from_millis(2));
+    }
+
+    /// Test that MultiArrayEmbeddingProvider trait is object-safe.
+    /// This test verifies compilation - if it compiles, the trait is object-safe.
+    #[test]
+    fn test_multi_array_embedding_provider_object_safety() {
+        fn _accepts_provider(_: &dyn MultiArrayEmbeddingProvider) {}
+        // Compiles = object-safe
+    }
+
+    /// Test that SingleEmbedder trait is object-safe.
+    #[test]
+    fn test_single_embedder_object_safety() {
+        fn _accepts_single(_: &dyn SingleEmbedder) {}
+        // Compiles = object-safe
+    }
+
+    /// Test that SparseEmbedder trait is object-safe.
+    #[test]
+    fn test_sparse_embedder_object_safety() {
+        fn _accepts_sparse(_: &dyn SparseEmbedder) {}
+        // Compiles = object-safe
+    }
+
+    /// Test that TokenEmbedder trait is object-safe.
+    #[test]
+    fn test_token_embedder_object_safety() {
+        fn _accepts_token(_: &dyn TokenEmbedder) {}
+        // Compiles = object-safe
+    }
+
+    /// Test that NUM_EMBEDDERS constant is 14.
+    #[test]
+    fn test_num_embedders_is_13() {
+        assert_eq!(NUM_EMBEDDERS, 14, "NUM_EMBEDDERS must be 14");
+    }
+
+    /// Test that SemanticFingerprint::zeroed() produces valid dimensions.
+    #[test]
+    fn test_zeroed_fingerprint_dimensions() {
+        let fp = SemanticFingerprint::zeroed();
+        assert_eq!(fp.e1_semantic.len(), 1024);
+        assert_eq!(fp.e2_temporal_recent.len(), 512);
+        assert_eq!(fp.e3_temporal_periodic.len(), 512);
+        assert_eq!(fp.e4_temporal_positional.len(), 512);
+        // E5 now uses dual vectors for asymmetric causal similarity
+        assert_eq!(fp.e5_causal_as_cause.len(), 768);
+        assert_eq!(fp.e5_causal_as_effect.len(), 768);
+        assert!(fp.e5_causal.is_empty()); // Legacy field empty in new format
+        assert!(fp.e6_sparse.is_empty()); // Sparse starts empty
+        assert_eq!(fp.e7_code.len(), 1536);
+        // E8 now uses dual vectors for asymmetric graph similarity
+        assert_eq!(fp.e8_graph_as_source.len(), 1024);
+        assert_eq!(fp.e8_graph_as_target.len(), 1024);
+        assert!(fp.e8_graph.is_empty()); // Legacy field empty in new format
+        assert_eq!(fp.e9_hdc.len(), 1024); // HDC projected
+                                           // E10 now uses dual vectors for asymmetric paraphrase/context similarity
+        assert_eq!(fp.e10_multimodal_paraphrase.len(), 768);
+        assert_eq!(fp.e10_multimodal_as_context.len(), 768);
+        assert_eq!(fp.e11_entity.len(), 768); // KEPLER
+        assert!(fp.e12_late_interaction.is_empty()); // Token-level starts empty
+        assert!(fp.e13_splade.is_empty()); // Sparse starts empty
+    }
+
+    /// Test TARGET_LATENCY_MS constant.
+    #[test]
+    fn test_target_latency_constant() {
+        assert_eq!(
+            MultiArrayEmbeddingOutput::TARGET_LATENCY_MS,
+            30,
+            "Target latency should be 30ms per constitution.yaml"
+        );
+    }
+
+    /// Test model_ids array in output.
+    #[test]
+    fn test_model_ids_in_output() {
+        let output = MultiArrayEmbeddingOutput {
+            fingerprint: SemanticFingerprint::zeroed(),
+            total_latency: Duration::ZERO,
+            per_embedder_latency: [Duration::ZERO; NUM_EMBEDDERS],
+            model_ids: [
+                "e5-large-v2".to_string(),
+                "exp-decay".to_string(),
+                "fourier".to_string(),
+                "sinusoidal-pe".to_string(),
+                "longformer".to_string(),
+                "splade".to_string(),
+                "qodo-embed".to_string(),
+                "minilm-graph".to_string(),
+                "hdc-10k".to_string(),
+                "clip".to_string(),
+                "minilm-entity".to_string(),
+                "colbert-v2".to_string(),
+                "splade-v3".to_string(),
+                "bge-m3-dense".to_string(),
+            ],
+            e5_hint_provenance: None,
+        };
+
+        assert_eq!(output.model_ids[0], "e5-large-v2");
+        assert_eq!(output.model_ids[11], "colbert-v2");
+        assert_eq!(output.model_ids[12], "splade-v3");
+        assert_eq!(output.model_ids.len(), NUM_EMBEDDERS);
+    }
+
+    // =========================================================================
+    // E4 INSTRUCTION FORMAT TESTS (Critical for session clustering)
+    // =========================================================================
+
+    /// Test e4_instruction() with session_id and sequence (hybrid mode).
+    ///
+    /// This is the critical fix test - verifies session_id is NOT dropped.
+    #[test]
+    fn test_e4_instruction_with_session_and_sequence() {
+        let metadata = EmbeddingMetadata::with_sequence("session-123", 42);
+        let instruction = metadata.e4_instruction().unwrap();
+
+        assert!(
+            instruction.contains("session:session-123"),
+            "Should include session_id: {}",
+            instruction
+        );
+        assert!(
+            instruction.contains("sequence:42"),
+            "Should include sequence: {}",
+            instruction
+        );
+        assert_eq!(instruction, "session:session-123 sequence:42");
+    }
+
+    /// Test e4_instruction() without session_id fails closed.
+    #[test]
+    fn test_e4_instruction_rejects_without_session() {
+        let metadata = EmbeddingMetadata {
+            session_id: None,
+            session_sequence: Some(42),
+            timestamp: None,
+            causal_hint: None,
+        };
+        let err = metadata.e4_instruction().unwrap_err();
+
+        assert!(
+            err.to_string().contains("session_id"),
+            "missing session must fail closed, got {err}"
+        );
+    }
+
+    /// Test e4_instruction() with timestamp only (no session or sequence) fails closed.
+    #[test]
+    fn test_e4_instruction_rejects_timestamp_only() {
+        use chrono::TimeZone;
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let metadata = EmbeddingMetadata::with_timestamp(ts);
+        let err = metadata.e4_instruction().unwrap_err();
+
+        assert!(
+            err.to_string().contains("session_id"),
+            "timestamp-only E4 must fail closed, got {err}"
+        );
+    }
+
+    /// Test e4_instruction() with session_id and timestamp (no sequence) fails closed.
+    #[test]
+    fn test_e4_instruction_rejects_session_and_timestamp_without_sequence() {
+        use chrono::TimeZone;
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let metadata = EmbeddingMetadata {
+            session_id: Some("my-session".to_string()),
+            session_sequence: None,
+            timestamp: Some(ts),
+            causal_hint: None,
+        };
+        let err = metadata.e4_instruction().unwrap_err();
+
+        assert!(
+            err.to_string().contains("session_sequence"),
+            "missing E4 sequence must fail closed, got {err}"
+        );
+    }
+
+    /// Test e4_instruction() with UUID session_id (common real-world case).
+    #[test]
+    fn test_e4_instruction_with_uuid_session() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let metadata = EmbeddingMetadata::with_sequence(uuid, 100);
+        let instruction = metadata.e4_instruction().unwrap();
+
+        assert_eq!(
+            instruction,
+            "session:a1b2c3d4-e5f6-7890-abcd-ef1234567890 sequence:100"
+        );
+    }
+
+    /// Test e4_instruction() with empty string session_id (edge case) fails closed.
+    #[test]
+    fn test_e4_instruction_rejects_empty_session() {
+        let metadata = EmbeddingMetadata::with_sequence("", 5);
+        let err = metadata.e4_instruction().unwrap_err();
+
+        assert!(
+            err.to_string().contains("session_id"),
+            "empty session must fail closed, got {err}"
+        );
+    }
+}

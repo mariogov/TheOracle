@@ -1,0 +1,6 @@
+[backup]
+d_root = "/var/lib/contextgraph"
+snapshot_root = "/var/lib/contextgraph/backups"
+include_rocksdb = true
+include_runtime_logs = true
+retention_days = 30

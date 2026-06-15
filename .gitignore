@@ -1,0 +1,252 @@
+# Directories excluded from repo (kept locally)
+benchmarks/
+benchmark_results/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/ci.yml
+!.github/workflows/ci_smoke_*.yml
+# TASK-TEST-011 Phase F workflow allowlist.
+!.github/workflows/e2e.yml
+!.github/workflows/chaos.yml
+!.github/workflows/load.yml
+!.github/workflows/soak.yml
+
+# Rust build artifacts
+target/
+target-test/
+**/*.rs.bk
+
+# Local training datasets (kept locally, not pushed)
+shakespear/
+
+# Local sample code scratchpad (kept locally, not pushed)
+samplecode/
+
+# Nested external repo (separate project, has its own .git)
+agentdb/
+ruvector/
+
+# Cargo project config
+.cargo/*
+!.cargo/
+!.cargo/config.toml
+
+# Claude/AI tooling directories and files
+.claude-flow/
+.hive-mind/
+.serena/
+.swarm/
+.claude/scheduled_tasks.lock
+# CLAUDE.md is internal AI-agent process memory; not published in the public repo.
+**/CLAUDE.md
+CLAUDE.local.md
+**/CLAUDE.local.md
+claude-flow
+
+# Coordination/memory state (ephemeral)
+# Note: /memory/ at root only - don't ignore src/memory/ source code
+/coordination/
+/memory/
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+
+# Generated/temporary files
+claude-flow.config.json
+hive-mind-prompt-*.txt
+# Project root .mcp.json is committed so shared Claude Code MCP servers load consistently.
+**/.mcp.json
+!/.mcp.json
+**/.mcp.local.json
+
+# Backup and copy files
+*_backup*
+*_bak*
+* copy.*
+* copy *
+*.bak
+*.backup
+*.orig
+
+# Node modules (if added later)
+node_modules/
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Playwright MCP session artifacts (ephemeral browser logs)
+.playwright-mcp/
+
+# Browser-automation slop at repo root (social-media/Stripe screenshots,
+# accessibility snapshots, base64 blobs). Root-anchored so legit files in
+# subdirectories are unaffected. Keep this list in sync with new automation runs.
+/li-*
+/li_*
+/linkedin-*
+/linkedin_*
+/x-*
+/yt-*
+/yt_*
+/youtube-*
+/chatgpt-*
+/cgpt-*
+/composer-*
+/composer[0-9]*
+/stripe-*
+/gmail-*
+/oracle-kernel-*
+/probe.png
+/*-b64.txt
+/*_b64.json
+/*_thumb_b64.json
+
+# Environment files (may contain secrets)
+.env
+.env.*
+!.env.example
+
+# Test coverage
+coverage/
+*.lcov
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+tarpaulin-report.html
+tarpaulin-report.json
+
+# Root models/ may be a source crate; ignore only heavyweight local model payloads.
+/models/artifacts/
+/models/cache/
+/models/checkpoints/
+/models/**/*.safetensors
+/models/**/*.bin
+/models/**/*.pt
+/models/**/*.onnx
+/models/**/*.h5
+/models/**/*.pb
+/models/**/*.tflite
+/models/**/*.pth
+/models/**/*.ckpt
+/models/**/*.msgpack
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+clipcannon/.venv/
+clipcannon/.pytest_cache/
+clipcannon/.ruff_cache/
+clipcannon/tmp/
+clipcannon/models/*
+!clipcannon/models/README.md
+!clipcannon/models/models_config.toml
+clipcannon/models/**/*.safetensors
+clipcannon/models/**/*.bin
+clipcannon/models/**/*.pt
+clipcannon/models/**/*.onnx
+clipcannon/models/**/*.h5
+clipcannon/models/**/*.pb
+clipcannon/models/**/*.tflite
+clipcannon/models/**/*.pth
+clipcannon/models/**/*.ckpt
+clipcannon/models/**/*.msgpack
+
+# HuggingFace cache and ML training artifacts
+.cache/
+huggingface_hub/
+wandb/
+mlruns/
+lightning_logs/
+checkpoints/
+tmp/
+.tmp/
+
+# Rust benchmark and debug artifacts
+criterion/
+flamegraph.svg
+perf.data
+perf.data.old
+*.rlib
+
+# Runtime data
+contextgraph_data/
+artefacts/
+
+# RocksDB runtime data
+data/
+
+# Stale/migration data folders
+contextgraph_data_incompatible_*/
+contextgraph_data_backup_*/
+contextgraph_data_corrupted_*/
+contextgraph_data.bak.*/
+
+# Large benchmark artifacts (regeneratable) — covered by benchmark_results/ above
+
+# Debug artifacts that shouldn't be tracked
+*.rmeta
+*.rlib.rmeta
+
+# === Public-release exclusions (internal/personal content kept local only) ===
+# AI coding-agent process, doctrine, and memory (internal workflow)
+/AGENTS.md
+/.claude/
+docs2/
+backupdocs/
+
+# Personal / non-public docs (correspondence, transcripts, other projects)
+docs/vopson/
+docs/agitranscript.md
+docs/leapableai_youtube_transcripts.md
+docs/alldata.md
+
+# Python/tooling caches not already covered
+.pytest_cache/
+.ruff_cache/
+
+# LaTeX build artifacts (keep .tex/.pdf/.bib, drop generated intermediates)
+*.aux
+*.bbl
+*.blg
+*.out
+*.fls
+*.fdb_latexmk
+*.toc
+*.synctex.gz
+
+# === TheOracle public repo: exclude internal tooling, fixtures, bulky docs ===
+# Root-anchored so nested crate dirs (e.g. crates/*/tests) are unaffected.
+/scripts/
+/tasks/
+/tests/
+/reference/
+/requirements/
+/systemd/
+/docs/

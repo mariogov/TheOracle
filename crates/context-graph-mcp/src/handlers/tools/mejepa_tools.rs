@@ -1,0 +1,7793 @@
+//! ME-JEPA Phase 4 inference MCP handlers.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Context, Result as AnyhowResult};
+use context_graph_mejepa::heal::{
+    all_referenced_cf_names, apply_promotion_approval, decode_value, encode_active_pointer_key,
+    is_holdout_rotation_event_key, pending_dynamic_embedder_promotions, AbcPromoter,
+    ActivePointerValue, HealError, HealReport, HealRocksStore, PromotionApprovalAction,
+    PromotionApprovalRequest as HealPromotionApprovalRequest, PromotionGate, PromotionLockState,
+    WitnessChainAppender, CF_MEJEPA_ACTIVE_POINTERS, CF_MEJEPA_HEAL_REPORTS,
+};
+use context_graph_mejepa::operator_override::{
+    count_operator_overrides, load_operator_override, operator_override_flags_for_predictions,
+    persist_operator_override, OperatorOverride, OverrideVerdict,
+};
+use context_graph_mejepa::{
+    bedrock_consistency_for_patch_diff, build_slot_preserving_cuda_compiler,
+    decode_reality_prediction, mejepa_mincut_panel, open_infer_rocksdb, open_mincut_rocksdb,
+    operator_contribution_report_from_db, promote_instrument_proposal,
+    propose_embedder_proposals_from_db, propose_instruments_from_db,
+    rank_counterfactual_candidates, read_embedder_proposals, read_instrument_proposal,
+    read_instrument_proposals, read_library_foundationality_report, read_mincut_report,
+    render_operator_contributions_weekly_section, search_latent_actions,
+    write_embedder_proposals_sync_readback, write_instrument_proposals_sync_readback,
+    write_mincut_report_sync_readback, ActiveLearningQueueState, ActualOutcome, AgentId,
+    CalibrationStore, ChunkId, CounterfactualCandidateRankingConfig, DdaSignals,
+    EmbedderProposalConfig, FailedGate, FeedbackId, FeedbackKind, FingerprintId,
+    FingerprintReference, InstrumentProposalConfig, InstrumentProposalDecision, LabelMethod,
+    LatentActionCandidate, LatentActionSearchConfig, LibraryId, MeJepaInferConfig, MincutOptions,
+    OracleOutcome, PanelGraphSource, PanelId, PatchBundle, PredictionId, ProjectIngestRequest,
+    ProjectReportRequest, RealityPrediction, ReconciliationStatus, RocksDbEvalStore,
+    RocksDbInferStore, SlotAttributionEvidence, SlotAttributionPolarity, SlotAttributionSource,
+    SurpriseEvent, SurpriseSeverity, SystemCostCounters, TaskContext, TestId, Verdict,
+    VerifyVerdict, WitnessHash,
+};
+use context_graph_mejepa_cf::{
+    CF_MEJEPA_ACTIVE_LEARNING_EVICTIONS, CF_MEJEPA_ACTIVE_LEARNING_LABELS,
+    CF_MEJEPA_ACTIVE_LEARNING_QUEUE, CF_MEJEPA_AGENT_FEEDBACK, CF_MEJEPA_CALIBRATION_HISTORY,
+    CF_MEJEPA_CHUNK_FOUNDATIONALITY, CF_MEJEPA_CROSS_LIBRARY_REFERENCES, CF_MEJEPA_DDA_SIGNALS,
+    CF_MEJEPA_EMBEDDER_PROPOSALS, CF_MEJEPA_FINGERPRINT_REFERENCES, CF_MEJEPA_INSTRUMENT_PROPOSALS,
+    CF_MEJEPA_LIBRARY_FOUNDATIONALITY, CF_MEJEPA_LIBRARY_REGISTRY, CF_MEJEPA_LIVE_PREDICTIONS,
+    CF_MEJEPA_MINCUT_REPORTS, CF_MEJEPA_MISTAKE_LOG, CF_MEJEPA_MODEL_PROMOTIONS,
+    CF_MEJEPA_OOD_CALIBRATIONS, CF_MEJEPA_OOD_ESCALATIONS, CF_MEJEPA_OPERATOR_CONTRIBUTIONS,
+    CF_MEJEPA_OPERATOR_OVERRIDES, CF_MEJEPA_REALITY_IMPACT, CF_MEJEPA_SKILL_LIFECYCLE_AUDIT,
+    CF_MEJEPA_TRAIN_CERTS,
+};
+use context_graph_mejepa_embedders::{query_vram_budget, VramBudget};
+use context_graph_mejepa_hygiene::{mcp_quota_status, HygieneMcpRequest};
+use context_graph_mejepa_tct::{
+    build_inspect_summary, open_tct_rocksdb, ConstellationStore, EmbedderId,
+};
+use rocksdb::{IteratorMode, WriteBatch, WriteOptions, DB};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tracing::info;
+
+use super::mejepa_agent_identity::{
+    resolve_feedback_identity, resolve_operator_identity, IdentityAttestationRequest,
+    ResolvedAgentIdentity, MEJEPA_AGENT_IDENTITY_CONFIG_INVALID, MEJEPA_AGENT_IDENTITY_UNVERIFIED,
+};
+use super::mejepa_phase7_storage::{subscriber_state_for_provenance, subscriber_status_for_paths};
+use crate::handlers::tools::helpers::ToolErrorKind;
+use crate::handlers::Handlers;
+use crate::protocol::{JsonRpcId, JsonRpcResponse};
+use crate::telemetry::gpu_wsl::{default_query as gpu_wsl_default_query, nvidia_smi_query};
+use crate::tools::names as tool_names;
+
+const ENV_TCT_DB: &str = "CONTEXTGRAPH_MEJEPA_TCT_DB";
+const ENV_HEAL_DB: &str = "CONTEXTGRAPH_MEJEPA_HEAL_DB";
+const ENV_HYGIENE_ARCHIVE_ROOT: &str = "CONTEXTGRAPH_MEJEPA_HYGIENE_ARCHIVE_ROOT";
+const ENV_PANEL_DB: &str = "CONTEXTGRAPH_MEJEPA_PANEL_DB";
+const ENV_INFER_DB: &str = "CONTEXTGRAPH_MEJEPA_INFER_DB";
+const ENV_PAUSE_PATH: &str = "CONTEXTGRAPH_MEJEPA_PAUSE_PATH";
+const DEFAULT_PAUSE_STATE_PATH: &str =
+    "/var/lib/contextgraph/state/cgreality/predictions_paused_until.json";
+const DIAGNOSTIC_CONSEQUENCE_SCHEMA_VERSION: u32 = 1;
+const DIAGNOSTIC_CONSEQUENCE_LIMIT: usize = 64;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VerifyRequest {
+    patch: PatchBundle,
+    context: TaskContext,
+    #[serde(default)]
+    include_provenance: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PredictLatestRequest {
+    session_id: String,
+    #[serde(default = "default_limit")]
+    limit: u32,
+    // TASK-FP-010 (#319) — let tests + non-default infer DBs override the path
+    // resolution used by `resolve_optional_infer_db_path` below.
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PredictWhatIfRequest {
+    patch: PatchBundle,
+    context: TaskContext,
+    compare_to_prediction_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SearchLatentActionsRequest {
+    context: TaskContext,
+    candidates: Vec<LatentActionCandidate>,
+    #[serde(default)]
+    config: LatentActionSearchConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RankCandidatesRequest {
+    context: TaskContext,
+    candidates: Vec<LatentActionCandidate>,
+    #[serde(default)]
+    config: CounterfactualCandidateRankingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MincutPanelRequest {
+    graph_source: PanelGraphSource,
+    #[serde(default)]
+    options: MincutOptions,
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+    #[serde(default = "default_persist_mincut_report")]
+    persist: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckBedrockConsistencyRequest {
+    patch: String,
+    #[serde(default = "default_bedrock_threshold")]
+    threshold: f32,
+    #[serde(default = "default_bedrock_top_k")]
+    top_k: usize,
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryFoundationalityRequest {
+    #[serde(default)]
+    library_id: Option<String>,
+    #[serde(default = "default_library_foundationality_top_k")]
+    top_k: usize,
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProposeInstrumentRequest {
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+    #[serde(default = "default_persist_instrument_proposals")]
+    persist: bool,
+    #[serde(default)]
+    config: InstrumentProposalConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingEmbedderProposalsRequest {
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+    #[serde(default = "default_persist_embedder_proposals")]
+    persist: bool,
+    #[serde(default)]
+    config: EmbedderProposalConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingEmbedderApprovalsRequest {
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PromoteInstrumentProposalRequest {
+    proposal_id: String,
+    decision: InstrumentProposalDecision,
+    #[serde(default)]
+    observed_holdout_delta: f32,
+    #[serde(default = "default_instrument_min_delta_required")]
+    min_delta_required: f32,
+    #[serde(default)]
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExplainPredictionRequest {
+    prediction_id: String,
+    db_path: Option<PathBuf>,
+    #[serde(default)]
+    include_fingerprint_references: bool,
+    #[serde(default = "default_fingerprint_reference_limit")]
+    fingerprint_reference_limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InspectPredictionRequest {
+    prediction_id: String,
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConsequenceTraceRequest {
+    prediction_id: String,
+    #[serde(default)]
+    consequence_id: Option<String>,
+    db_path: Option<PathBuf>,
+    #[serde(default)]
+    chunk_source_jsonl: Option<PathBuf>,
+    #[serde(default)]
+    require_source_bytes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvidenceToConsequencesRequest {
+    #[serde(default)]
+    chunk_id: Option<String>,
+    #[serde(default)]
+    skill_id: Option<String>,
+    #[serde(default)]
+    constellation_id: Option<String>,
+    #[serde(default = "default_consequence_lookup_limit")]
+    limit: u32,
+    db_path: Option<PathBuf>,
+    #[serde(default)]
+    chunk_source_jsonl: Option<PathBuf>,
+    #[serde(default)]
+    require_source_bytes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReplayPredictionRequest {
+    prediction_id: String,
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RealityImpactRequest {
+    prediction_id: String,
+    runtime_root: PathBuf,
+    #[serde(default = "default_replay_window_ms")]
+    replay_window_ms: i64,
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordAgentFeedbackRequest {
+    prediction_id: String,
+    #[serde(default)]
+    agent_id: Option<String>,
+    feedback_kind: FeedbackKind,
+    agent_explanation: String,
+    actual_outcome: Option<ActualOutcomeRequest>,
+    severity: SurpriseSeverity,
+    #[serde(default)]
+    extra_structured_data: Value,
+    identity_attestation: Option<IdentityAttestationRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActualOutcomeRequest {
+    oracle_outcome: OracleOutcome,
+    #[serde(default)]
+    failed_tests: Vec<String>,
+    runtime_ms: Option<u64>,
+    notes: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PausePredictionsRequest {
+    state_path: Option<PathBuf>,
+    duration_mins: u64,
+    #[serde(default = "default_pause_reason")]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperatorOverridePredictionRequest {
+    db_path: Option<PathBuf>,
+    prediction_id: String,
+    override_verdict: OverrideVerdict,
+    reason: String,
+    operator_id: String,
+    identity_attestation: Option<IdentityAttestationRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperatorContributionsRequest {
+    db_path: Option<PathBuf>,
+    window: usize,
+    operator_id: Option<String>,
+    #[serde(default)]
+    format: OperatorContributionsFormat,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OperatorContributionsFormat {
+    #[default]
+    Json,
+    Markdown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConstellationInspectRequest {
+    db_path: Option<PathBuf>,
+    version_id: Option<String>,
+    runtime_embedder_versions: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HealStatusRequest {
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RollbackToRequest {
+    db_path: Option<PathBuf>,
+    witness_chain_path: PathBuf,
+    target_witness_chain_offset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PromoteApprovalRequest {
+    db_path: Option<PathBuf>,
+    promotion_id: String,
+    operator_id: String,
+    action: PromotionApprovalAction,
+    operator_reason: String,
+    #[serde(default = "default_two_person_rule")]
+    two_person_rule: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonStatusVramBudget {
+    #[default]
+    ContentSet,
+    FullPhase1,
+}
+
+impl DaemonStatusVramBudget {
+    fn as_budget(self) -> VramBudget {
+        match self {
+            Self::ContentSet => VramBudget::content_set_rtx5090(),
+            Self::FullPhase1 => VramBudget::full_phase1_rtx5090(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MejepaDaemonStatusRequest {
+    infer_db_path: Option<PathBuf>,
+    panel_db_path: Option<PathBuf>,
+    heal_db_path: Option<PathBuf>,
+    quota_db_path: Option<PathBuf>,
+    archive_root: Option<PathBuf>,
+    #[serde(default = "default_include_vram")]
+    include_vram: bool,
+    #[serde(default)]
+    vram_budget: DaemonStatusVramBudget,
+}
+
+fn default_limit() -> u32 {
+    10
+}
+
+fn default_replay_window_ms() -> i64 {
+    context_graph_mejepa::DEFAULT_REALITY_IMPACT_REPLAY_WINDOW_MS
+}
+
+fn current_unix_ms_i64() -> Result<i64, String> {
+    // Fail closed on a corrupt clock: downstream consumers (e.g.
+    // learned_head_candidate.created_at_unix_ms) explicitly reject <= 0
+    // timestamps, so silently coercing pre-1970 to 0 would surface as a
+    // confusing validation error far from the cause. Return a structured
+    // error code instead.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("MEJEPA_SYSTEM_CLOCK_BEFORE_UNIX_EPOCH: {err}"))
+        .map(|dur| dur.as_millis().min(i64::MAX as u128) as i64)
+}
+
+fn default_fingerprint_reference_limit() -> u32 {
+    5
+}
+
+fn default_consequence_lookup_limit() -> u32 {
+    DIAGNOSTIC_CONSEQUENCE_LIMIT as u32
+}
+
+fn default_pause_reason() -> String {
+    "manual pause".to_string()
+}
+
+fn default_two_person_rule() -> bool {
+    true
+}
+
+fn default_include_vram() -> bool {
+    true
+}
+
+fn default_persist_instrument_proposals() -> bool {
+    true
+}
+
+fn default_persist_embedder_proposals() -> bool {
+    true
+}
+
+fn default_instrument_min_delta_required() -> f32 {
+    context_graph_mejepa::DEFAULT_INSTRUMENT_PROPOSAL_MIN_DELTA
+}
+
+fn default_persist_mincut_report() -> bool {
+    true
+}
+
+fn default_bedrock_threshold() -> f32 {
+    0.75
+}
+
+fn default_bedrock_top_k() -> usize {
+    5
+}
+
+fn default_library_foundationality_top_k() -> usize {
+    10
+}
+
+impl Handlers {
+    pub(crate) async fn call_mejepa_verify(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: VerifyRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_VERIFY
+                    ),
+                );
+            }
+        };
+        if let Err(err) = request
+            .patch
+            .validate()
+            .and_then(|_| request.context.validate())
+        {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                &format!("{}: {err}", err.code()),
+            );
+        }
+        let db_path = match infer_db_path() {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let pause_path = match resolve_pause_state_path(None) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let repo_root = request.context.environment.repo_root.clone();
+        info!(
+            tool = tool_names::MEJEPA_VERIFY,
+            task_id = %request.context.task_id.0,
+            db_path = %db_path.display(),
+            "ME-JEPA verify"
+        );
+        let session_id = request.context.session_id;
+        let now_ms = match now_unix_ms() {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_structured(
+                    id,
+                    ToolErrorKind::Execution,
+                    "MEJEPA_PAUSE_CLOCK_FAILED",
+                    &err.to_string(),
+                    json!({"statePath": pause_path}),
+                );
+            }
+        };
+        match active_pause_state(&pause_path, now_ms) {
+            Ok(Some(pause_state)) => {
+                let verdict = VerifyVerdict::EscalateToHuman {
+                    reality_prediction: None,
+                    failed_gate: FailedGate::PredictionPaused {
+                        paused_until_unix_ms: pause_state.paused_until_unix_ms,
+                        reason: pause_state.reason.clone(),
+                    },
+                    gates_passed: 0,
+                };
+                let mut response = match serde_json::to_value(verdict) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return self.tool_error_structured(
+                            id,
+                            ToolErrorKind::Execution,
+                            "MEJEPA_PAUSE_RESPONSE_SERIALIZE_FAILED",
+                            &err.to_string(),
+                            json!({"statePath": pause_path}),
+                        );
+                    }
+                };
+                response["pause_state"] = pause_state_value(&pause_path, &pause_state, now_ms);
+                if request.include_provenance {
+                    response["provenance"] = json!({
+                        "codeVersion": env!("CARGO_PKG_VERSION"),
+                        "dbPath": db_path,
+                        "mode": "paused_before_slot_preserving_cuda_compiler",
+                        "pauseStatePath": pause_path,
+                    });
+                }
+                return self.tool_result(id, response);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return self.tool_error_structured(
+                    id,
+                    ToolErrorKind::Storage,
+                    "MEJEPA_PAUSE_STATE_INVALID",
+                    &err.to_string(),
+                    json!({"statePath": pause_path}),
+                );
+            }
+        }
+        let result = (|| {
+            let db = open_infer_rocksdb(&db_path)?;
+            let subscriber_state = subscriber_state_for_provenance(db.as_ref(), session_id)
+                .map_err(
+                    |detail| context_graph_mejepa::MejepaInferError::InvalidInput {
+                        field: "subscriber_state".to_string(),
+                        detail,
+                    },
+                )?;
+            let calibration = CalibrationStore::new(db.clone(), 30)?;
+            let store = Arc::new(RocksDbInferStore::new_with_system_cost_counters(
+                db,
+                Arc::clone(&self.system_cost_counters),
+            ));
+            let compiler = build_slot_preserving_cuda_compiler(
+                repo_root,
+                store,
+                calibration,
+                MeJepaInferConfig::default(),
+            )?;
+            let verdict = compiler.verify(&request.patch, &request.context)?;
+            let mut response = serde_json::to_value(verdict)?;
+            let subscriber_state_value = subscriber_state.unwrap_or(serde_json::Value::Null);
+            response["subscriber_state"] = subscriber_state_value.clone();
+            if request.include_provenance {
+                response["provenance"] = json!({
+                    "codeVersion": env!("CARGO_PKG_VERSION"),
+                    "dbPath": db_path,
+                    "mode": "slot_preserving_cuda_real_compiler",
+                    "last_consumed_shift_id": subscriber_state_value
+                        .get("last_consumed_shift_id")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "subscriber_lag_at_call_time": subscriber_state_value
+                        .get("subscriber_lag_at_call_time")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                });
+            }
+            Ok::<serde_json::Value, context_graph_mejepa::MejepaInferError>(response)
+        })();
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_predict_latest(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PredictLatestRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PREDICT_LATEST
+                    ),
+                );
+            }
+        };
+        if request.session_id.len() != 32
+            || !request.session_id.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                "sessionId must be exactly 32 hexadecimal characters",
+            );
+        }
+        let mut session_id = [0u8; 16];
+        if let Err(err) = hex::decode_to_slice(&request.session_id, &mut session_id) {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                &format!("sessionId decode failed: {err}"),
+            );
+        }
+        if !(1..=1000).contains(&request.limit) {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                "limit must be in [1, 1000]",
+            );
+        }
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = (|| {
+            let db = open_infer_rocksdb(&db_path)?;
+            let store = RocksDbInferStore::new(db);
+            let predictions = context_graph_mejepa::MejepaStore::read_live_predictions(
+                &store,
+                session_id,
+                request.limit,
+            )?;
+            let session_known =
+                context_graph_mejepa::MejepaStore::session_known(&store, session_id)?;
+            let q4_trust_gate = context_graph_mejepa::default_q4_trust_gate_report()?;
+            let q4 = predictions
+                .iter()
+                .map(|prediction| {
+                    let trusted =
+                        context_graph_mejepa::trusted_q4_consequences(prediction, &q4_trust_gate);
+                    q4_projection(prediction, &q4_trust_gate, &trusted)
+                })
+                .collect::<Vec<_>>();
+            let slot_attribution_summaries = predictions
+                .iter()
+                .map(|prediction| slot_attribution_summary(prediction, 8))
+                .collect::<Vec<_>>();
+            Ok::<serde_json::Value, context_graph_mejepa::MejepaInferError>(json!({
+                "predictions": predictions,
+                "slotAttributionSummaries": slot_attribution_summaries,
+                "q4TrustGate": q4_trust_gate,
+                "q4": q4,
+                "session_known": session_known
+            }))
+        })();
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Storage,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_project_ingest(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ProjectIngestRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PROJECT_INGEST
+                    ),
+                );
+            }
+        };
+        match context_graph_mejepa::run_project_ingest_with_multi_array_provider(
+            request,
+            self.multi_array_provider.clone(),
+        )
+        .await
+        {
+            Ok(report) => self.tool_result(id, json!(report)),
+            Err(err) => self.tool_error_typed(
+                id,
+                ToolErrorKind::Execution,
+                &format!("{}: {err}", err.code()),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_project_report(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ProjectReportRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PROJECT_REPORT
+                    ),
+                );
+            }
+        };
+        match context_graph_mejepa::run_project_report(request) {
+            Ok(report) => self.tool_result(id, json!(report)),
+            Err(err) => self.tool_error_typed(
+                id,
+                ToolErrorKind::Execution,
+                &format!("{}: {err}", err.code()),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_predict_what_if(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PredictWhatIfRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PREDICT_WHAT_IF
+                    ),
+                );
+            }
+        };
+        if let Err(err) = request
+            .patch
+            .validate()
+            .and_then(|_| request.context.validate())
+        {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                &format!("{}: {err}", err.code()),
+            );
+        }
+        let db_path = match infer_db_path() {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = run_predict_what_if(&db_path, request);
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_PREDICT_WHAT_IF_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_search_latent_actions(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: SearchLatentActionsRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_SEARCH_LATENT_ACTIONS
+                    ),
+                );
+            }
+        };
+        if let Err(err) = request.context.validate().and_then(|_| {
+            request.config.validate()?;
+            for candidate in &request.candidates {
+                candidate.validate()?;
+            }
+            Ok(())
+        }) {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                &format!("{}: {err}", err.code()),
+            );
+        }
+        let db_path = match infer_db_path() {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = run_search_latent_actions(&db_path, request);
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_SEARCH_LATENT_ACTIONS_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_rank_candidates(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: RankCandidatesRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_RANK_CANDIDATES
+                    ),
+                );
+            }
+        };
+        if let Err(err) = request.context.validate().and_then(|_| {
+            request.config.validate()?;
+            for candidate in &request.candidates {
+                candidate.validate()?;
+            }
+            Ok(())
+        }) {
+            return self.tool_error_typed(
+                id,
+                ToolErrorKind::Validation,
+                &format!("{}: {err}", err.code()),
+            );
+        }
+        let db_path = match infer_db_path() {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = run_rank_candidates(&db_path, request);
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_RANK_CANDIDATES_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_mincut_panel(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: MincutPanelRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_MINCUT_PANEL
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_mincut_panel(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_MINCUT_PANEL_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path, "mincutReportCf": CF_MEJEPA_MINCUT_REPORTS}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_check_bedrock_consistency(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: CheckBedrockConsistencyRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_CHECK_BEDROCK_CONSISTENCY
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_check_bedrock_consistency(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_CHECK_BEDROCK_CONSISTENCY_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path, "foundationalityCf": CF_MEJEPA_CHUNK_FOUNDATIONALITY}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_library_foundationality(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: LibraryFoundationalityRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_LIBRARY_FOUNDATIONALITY
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_library_foundationality(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_LIBRARY_FOUNDATIONALITY_FAILED",
+                &err.to_string(),
+                json!({
+                    "dbPath": db_path,
+                    "libraryRegistryCf": CF_MEJEPA_LIBRARY_REGISTRY,
+                    "libraryFoundationalityCf": CF_MEJEPA_LIBRARY_FOUNDATIONALITY,
+                    "crossLibraryReferencesCf": CF_MEJEPA_CROSS_LIBRARY_REFERENCES
+                }),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_propose_instrument(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ProposeInstrumentRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PROPOSE_INSTRUMENT
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_propose_instrument(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_PROPOSE_INSTRUMENT_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path, "instrumentProposalCf": CF_MEJEPA_INSTRUMENT_PROPOSALS}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_pending_embedder_proposals(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PendingEmbedderProposalsRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PENDING_EMBEDDER_PROPOSALS
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_pending_embedder_proposals(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_PENDING_EMBEDDER_PROPOSALS_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path, "embedderProposalCf": CF_MEJEPA_EMBEDDER_PROPOSALS}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_pending_embedder_approvals(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PendingEmbedderApprovalsRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PENDING_EMBEDDER_APPROVALS
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_heal_db_path(request.db_path) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_pending_embedder_approvals(&db_path) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_promote_instrument_proposal(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PromoteInstrumentProposalRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PROMOTE_INSTRUMENT_PROPOSAL
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_promote_instrument_proposal(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Execution,
+                "MEJEPA_PROMOTE_INSTRUMENT_PROPOSAL_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path, "instrumentProposalCf": CF_MEJEPA_INSTRUMENT_PROPOSALS}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_explain_prediction(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ExplainPredictionRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_EXPLAIN_PREDICTION
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = run_explain_prediction(&db_path, request);
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_EXPLAIN_PREDICTION_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_inspect_prediction(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: InspectPredictionRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_INSPECT_PREDICTION
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = run_inspect_prediction(&db_path, request);
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_INSPECT_PREDICTION_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_consequence_trace(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ConsequenceTraceRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_CONSEQUENCE_TRACE
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_consequence_trace(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_CONSEQUENCE_TRACE_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_evidence_to_consequences(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: EvidenceToConsequencesRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_EVIDENCE_TO_CONSEQUENCES
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_evidence_to_consequences(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_EVIDENCE_TO_CONSEQUENCES_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_replay_prediction(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ReplayPredictionRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_REPLAY_PREDICTION
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let prediction_id =
+            match context_graph_mejepa::parse_prediction_id_hex(&request.prediction_id) {
+                Ok(value) => value,
+                Err(err) => {
+                    return self.tool_error_structured(
+                        id,
+                        ToolErrorKind::Validation,
+                        "MEJEPA_REPLAY_PREDICTION_ID_INVALID",
+                        &err.to_string(),
+                        json!({"predictionId": request.prediction_id}),
+                    );
+                }
+            };
+        let result = context_graph_mejepa::replay_prediction_from_db(&db_path, prediction_id);
+        match result {
+            Ok(value) => match serde_json::to_value(value) {
+                Ok(value) => self.tool_result(id, value),
+                Err(err) => self.tool_error_structured(
+                    id,
+                    ToolErrorKind::Execution,
+                    "MEJEPA_REPLAY_PREDICTION_SERIALIZE_FAILED",
+                    &err.to_string(),
+                    json!({"dbPath": db_path}),
+                ),
+            },
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_REPLAY_PREDICTION_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_reality_impact(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: RealityImpactRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_REALITY_IMPACT
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let prediction_id =
+            match context_graph_mejepa::parse_prediction_id_hex(&request.prediction_id) {
+                Ok(value) => value,
+                Err(err) => {
+                    return self.tool_error_structured(
+                        id,
+                        ToolErrorKind::Validation,
+                        "MEJEPA_REALITY_IMPACT_PREDICTION_ID_INVALID",
+                        &err.to_string(),
+                        json!({"predictionId": request.prediction_id}),
+                    );
+                }
+            };
+        let db = match open_infer_rocksdb(&db_path) {
+            Ok(db) => db,
+            Err(err) => {
+                return self.tool_error_structured(
+                    id,
+                    ToolErrorKind::Storage,
+                    "MEJEPA_REALITY_IMPACT_DB_OPEN_FAILED",
+                    &err.to_string(),
+                    json!({"dbPath": db_path}),
+                );
+            }
+        };
+        let created_at_unix_ms = match current_unix_ms_i64() {
+            Ok(ts) => ts,
+            Err(err) => {
+                return self.tool_error_structured(
+                    id,
+                    ToolErrorKind::Execution,
+                    "MEJEPA_SYSTEM_CLOCK_BEFORE_UNIX_EPOCH",
+                    &err,
+                    json!({"dbPath": db_path}),
+                );
+            }
+        };
+        let result = context_graph_mejepa::replay_and_persist_reality_impact(
+            db.as_ref(),
+            prediction_id.0,
+            &request.runtime_root,
+            request.replay_window_ms,
+            created_at_unix_ms,
+        );
+        match result {
+            Ok(record) => match serde_json::to_value(&record) {
+                Ok(value) => self.tool_result(
+                    id,
+                    json!({
+                        "record": value,
+                        "sourceOfTruth": {
+                            "dbPath": db_path.display().to_string(),
+                            "shiftLogRoot": request.runtime_root.display().to_string(),
+                            "predictionCf": CF_MEJEPA_LIVE_PREDICTIONS,
+                            "realityImpactCf": CF_MEJEPA_REALITY_IMPACT,
+                            "predictionId": request.prediction_id
+                        }
+                    }),
+                ),
+                Err(err) => self.tool_error_structured(
+                    id,
+                    ToolErrorKind::Execution,
+                    "MEJEPA_REALITY_IMPACT_SERIALIZE_FAILED",
+                    &err.to_string(),
+                    json!({"dbPath": db_path}),
+                ),
+            },
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_REALITY_IMPACT_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path, "shiftLogRoot": request.runtime_root}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_record_agent_feedback(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request_body_bytes = match serde_json::to_vec(&args) {
+            Ok(bytes) => bytes.len() as u64,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} request-body serialization failed: {err}",
+                        tool_names::MEJEPA_RECORD_AGENT_FEEDBACK
+                    ),
+                );
+            }
+        };
+        let request: RecordAgentFeedbackRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_RECORD_AGENT_FEEDBACK
+                    ),
+                );
+            }
+        };
+        let db_path = match infer_db_path() {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = record_agent_feedback_in_db(
+            &db_path,
+            request,
+            Some(Arc::clone(&self.system_cost_counters)),
+        );
+        match result {
+            Ok(mut value) => {
+                self.system_cost_counters
+                    .record_agent_feedback_tokens(request_body_bytes);
+                let snapshot_json = match serde_json::to_value(self.system_cost_counters.snapshot())
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return self.tool_error_structured(
+                            id,
+                            ToolErrorKind::Execution,
+                            "MEJEPA_SYSTEM_COST_SNAPSHOT_SERIALIZE_FAILED",
+                            &err.to_string(),
+                            json!({}),
+                        );
+                    }
+                };
+                let Some(object) = value.as_object_mut() else {
+                    return self.tool_error_structured(
+                        id,
+                        ToolErrorKind::Execution,
+                        "MEJEPA_RECORD_AGENT_FEEDBACK_RESULT_SHAPE_INVALID",
+                        "record_agent_feedback_in_db returned a non-object response",
+                        json!({"dbPath": db_path}),
+                    );
+                };
+                object.insert("systemCostSnapshot".to_string(), snapshot_json);
+                self.tool_result(id, value)
+            }
+            Err(err) => {
+                let message = err.to_string();
+                let (kind, code) = mejepa_write_error_classification(
+                    &message,
+                    ToolErrorKind::Storage,
+                    "MEJEPA_RECORD_AGENT_FEEDBACK_FAILED",
+                );
+                self.tool_error_structured(id, kind, code, &message, json!({"dbPath": db_path}))
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_bootstrap_status(
+        &self,
+        id: Option<JsonRpcId>,
+        _args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let db_path = match infer_db_path() {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result = (|| {
+            let db = open_infer_rocksdb(&db_path)?;
+            let oracle_verdict_rows = count_cf_any(
+                db.as_ref(),
+                context_graph_mejepa_cf::CF_MEJEPA_ORACLE_VERDICTS,
+            )?;
+            let live_prediction_rows = count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS)?;
+            let agent_feedback_rows = count_cf_any(db.as_ref(), CF_MEJEPA_AGENT_FEEDBACK)?;
+            let active_learning_queue_present = db
+                .get_cf(
+                    cf_handle(db.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_QUEUE)?,
+                    b"active",
+                )?
+                .is_some();
+            let stage = if oracle_verdict_rows >= 1000 {
+                "warm"
+            } else if oracle_verdict_rows > 0 || live_prediction_rows > 0 {
+                "bootstrapping"
+            } else {
+                "cold"
+            };
+            Ok::<Value, anyhow::Error>(json!({
+                "stage": stage,
+                "counts": {
+                    "oracleVerdicts": oracle_verdict_rows,
+                    "livePredictions": live_prediction_rows,
+                    "agentFeedback": agent_feedback_rows,
+                    "activeLearningQueuePresent": active_learning_queue_present
+                },
+                "sourceOfTruth": {
+                    "dbPath": db_path,
+                    "cfs": [
+                        context_graph_mejepa_cf::CF_MEJEPA_ORACLE_VERDICTS,
+                        CF_MEJEPA_LIVE_PREDICTIONS,
+                        CF_MEJEPA_AGENT_FEEDBACK,
+                        CF_MEJEPA_ACTIVE_LEARNING_QUEUE
+                    ]
+                }
+            }))
+        })();
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_BOOTSTRAP_STATUS_FAILED",
+                &err.to_string(),
+                json!({"dbPath": db_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_constellation_inspect(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: ConstellationInspectRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_CONSTELLATION_INSPECT
+                    ),
+                );
+            }
+        };
+        let db_path = match request.db_path {
+            path @ Some(_) => match resolve_tct_db_path(path) {
+                Ok(path) => path,
+                Err(message) => {
+                    return self.tool_error_typed(id, ToolErrorKind::Validation, &message)
+                }
+            },
+            None => match resolve_tct_db_path(None) {
+                Ok(path) => path,
+                Err(message) => {
+                    return self.tool_error_typed(id, ToolErrorKind::Validation, &message)
+                }
+            },
+        };
+        let runtime_versions = match parse_runtime_versions(&request.runtime_embedder_versions) {
+            Ok(value) => value,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        let result =
+            run_constellation_inspect(&db_path, request.version_id.as_deref(), &runtime_versions);
+        match result {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_heal_status(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: HealStatusRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_HEAL_STATUS
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_heal_db_path(request.db_path) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_heal_status(&db_path) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Storage,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_daemon_status(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: MejepaDaemonStatusRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_DAEMON_STATUS
+                    ),
+                );
+            }
+        };
+        match self.run_mejepa_daemon_status(request).await {
+            Ok(value) => self.tool_result(id, value),
+            Err(message) => self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_pause_predictions(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PausePredictionsRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PAUSE_PREDICTIONS
+                    ),
+                );
+            }
+        };
+        let state_path = match resolve_pause_state_path(request.state_path) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match write_pause_state(&state_path, request.duration_mins, &request.reason) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => self.tool_error_structured(
+                id,
+                ToolErrorKind::Storage,
+                "MEJEPA_PAUSE_PREDICTIONS_FAILED",
+                &err.to_string(),
+                json!({"statePath": state_path}),
+            ),
+        }
+    }
+
+    pub(crate) async fn call_mejepa_operator_override_prediction(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: OperatorOverridePredictionRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match record_operator_override_in_db(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                let message = err.to_string();
+                let (kind, code) = mejepa_write_error_classification(
+                    &message,
+                    ToolErrorKind::Storage,
+                    "MEJEPA_OPERATOR_OVERRIDE_FAILED",
+                );
+                self.tool_error_structured(id, kind, code, &message, json!({"dbPath": db_path}))
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_operator_contributions(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: OperatorContributionsRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_OPERATOR_CONTRIBUTIONS
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_optional_infer_db_path(request.db_path.as_ref()) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match operator_contributions_report_in_db(&db_path, request) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                let message = err.to_string();
+                let (kind, code) = mejepa_write_error_classification(
+                    &message,
+                    ToolErrorKind::Storage,
+                    "MEJEPA_OPERATOR_CONTRIBUTIONS_FAILED",
+                );
+                self.tool_error_structured(id, kind, code, &message, json!({"dbPath": db_path}))
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_rollback_to(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: RollbackToRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_ROLLBACK_TO
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_heal_db_path(request.db_path) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_rollback_to(
+            &db_path,
+            request.witness_chain_path,
+            request.target_witness_chain_offset,
+        ) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    pub(crate) async fn call_mejepa_promote_approval(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let request: PromoteApprovalRequest = match serde_json::from_value(args) {
+            Ok(value) => value,
+            Err(err) => {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    &format!(
+                        "{} schema validation failed: {err}",
+                        tool_names::MEJEPA_PROMOTE_APPROVAL
+                    ),
+                );
+            }
+        };
+        let db_path = match resolve_heal_db_path(request.db_path) {
+            Ok(path) => path,
+            Err(message) => return self.tool_error_typed(id, ToolErrorKind::Validation, &message),
+        };
+        match run_promote_approval(
+            &db_path,
+            &request.promotion_id,
+            &request.operator_id,
+            request.action,
+            &request.operator_reason,
+            request.two_person_rule,
+        ) {
+            Ok(value) => self.tool_result(id, value),
+            Err(err) => {
+                err.log_context(file!());
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("{}: {err}", err.code()),
+                )
+            }
+        }
+    }
+
+    async fn run_mejepa_daemon_status(
+        &self,
+        request: MejepaDaemonStatusRequest,
+    ) -> Result<serde_json::Value, String> {
+        let started = Instant::now();
+        let infer_db_path =
+            resolve_optional_path(request.infer_db_path, ENV_INFER_DB, "inferDbPath")?;
+        let panel_db_path =
+            resolve_optional_path(request.panel_db_path, ENV_PANEL_DB, "panelDbPath")?;
+        let heal_db_path = resolve_optional_path(request.heal_db_path, ENV_HEAL_DB, "healDbPath")?;
+        let quota_db_path = request
+            .quota_db_path
+            .map(|path| validate_non_empty_path("quotaDbPath", path))
+            .transpose()?
+            .or_else(|| infer_db_path.clone());
+        let archive_root = resolve_optional_path(
+            request.archive_root,
+            ENV_HYGIENE_ARCHIVE_ROOT,
+            "archiveRoot",
+        )?;
+
+        let mut components = BTreeMap::new();
+        components.insert("runtime".to_string(), self.mejepa_runtime_status().await);
+
+        let subscriber = match infer_db_path.as_deref() {
+            Some(path) => match subscriber_status_for_paths(path, panel_db_path.as_deref()).await {
+                Ok(value) => healthy_component(value),
+                Err(message) => unavailable_component(
+                    "MEJEPA_DAEMON_STATUS_SUBSCRIBER_READ_FAILED",
+                    message,
+                    json!({"inferDbPath": path, "panelDbPath": panel_db_path}),
+                ),
+            },
+            None => unavailable_component(
+                "MEJEPA_DAEMON_STATUS_INFER_DB_MISSING",
+                format!("inferDbPath or {ENV_INFER_DB} is required for subscriber status"),
+                json!({"env": ENV_INFER_DB}),
+            ),
+        };
+        components.insert("subscriber".to_string(), subscriber);
+
+        let heal = match heal_db_path.as_deref() {
+            Some(path) => match run_heal_status(path) {
+                Ok(value) => healthy_component(value),
+                Err(err) => unavailable_component(
+                    err.code().to_string(),
+                    err.to_string(),
+                    json!({"healDbPath": path}),
+                ),
+            },
+            None => unavailable_component(
+                "MEJEPA_DAEMON_STATUS_HEAL_DB_MISSING",
+                format!("healDbPath or {ENV_HEAL_DB} is required for heal status"),
+                json!({"env": ENV_HEAL_DB}),
+            ),
+        };
+        components.insert("heal".to_string(), heal);
+
+        let quota = match (quota_db_path.as_ref(), archive_root.as_ref()) {
+            (Some(db_path), Some(root)) => {
+                let request = HygieneMcpRequest {
+                    db_path: db_path.clone(),
+                    archive_root: root.clone(),
+                };
+                match mcp_quota_status(request) {
+                    Ok(value) => healthy_component(value),
+                    Err(err) => unavailable_component(
+                        err.code.to_string(),
+                        err.to_string(),
+                        json!({"quotaDbPath": db_path, "archiveRoot": root}),
+                    ),
+                }
+            }
+            (None, _) => unavailable_component(
+                "MEJEPA_DAEMON_STATUS_QUOTA_DB_MISSING",
+                format!("quotaDbPath or {ENV_INFER_DB} is required for quota status"),
+                json!({"env": ENV_INFER_DB}),
+            ),
+            (_, None) => unavailable_component(
+                "MEJEPA_DAEMON_STATUS_ARCHIVE_ROOT_MISSING",
+                format!("archiveRoot or {ENV_HYGIENE_ARCHIVE_ROOT} is required for quota status"),
+                json!({"env": ENV_HYGIENE_ARCHIVE_ROOT}),
+            ),
+        };
+        components.insert("quota".to_string(), quota);
+
+        let vram = if request.include_vram {
+            let nvidia_smi = match nvidia_smi_query(gpu_wsl_default_query()).await {
+                Ok(value) => json!({
+                    "status": "available",
+                    "unavailable": !value.unavailable_fields.is_empty(),
+                    "telemetry": value
+                }),
+                Err(err) => json!({
+                    "status": "unavailable",
+                    "unavailable": true,
+                    "fault": err
+                }),
+            };
+            match query_vram_budget(request.vram_budget.as_budget()) {
+                Ok(value) => healthy_component(json!({
+                    "cudaDriverBudget": value,
+                    "nvidiaSmi": nvidia_smi,
+                    "sourceOfTruth": "cuda_driver_cuMemGetInfo_v2",
+                    "nvidiaSmiAuthoritative": false
+                })),
+                Err(err) => unavailable_component(
+                    err.code().to_string(),
+                    err.to_string(),
+                    json!({
+                        "budget": format!("{:?}", request.vram_budget),
+                        "nvidiaSmi": nvidia_smi
+                    }),
+                ),
+            }
+        } else {
+            disabled_component("VRAM status disabled by includeVram=false")
+        };
+        components.insert("vram".to_string(), vram);
+
+        Ok(json!({
+            "tool": tool_names::MEJEPA_DAEMON_STATUS,
+            "overallStatus": aggregate_status(&components),
+            "generatedAtUnixMs": unix_now_ms()?,
+            "elapsedMs": started.elapsed().as_millis() as u64,
+            "components": components,
+            "sourceOfTruth": {
+                "runtime": "process",
+                "subscriber": "CF_MEJEPA_SHIFT_WATERMARK + optional CF_MEJEPA_PANELS",
+                "heal": "ME-JEPA heal RocksDB CFs",
+                "quota": "ME-JEPA hygiene RocksDB CFs + archive root filesystem",
+                "vram": "CUDA driver cuMemGetInfo_v2; nvidia-smi diagnostic is non-authoritative under WSL"
+            }
+        }))
+    }
+
+    async fn mejepa_runtime_status(&self) -> serde_json::Value {
+        match &self.daemon_state {
+            Some(state) => healthy_component(json!({
+                "pid": std::process::id(),
+                "mode": "daemon",
+                "uptimeSecs": state.start_time.elapsed().as_secs(),
+                "activeConnections": state.active_connections.load(std::sync::atomic::Ordering::SeqCst),
+                "maxConnections": state.max_connections,
+                "backgroundShutdown": state.background_shutdown.load(std::sync::atomic::Ordering::SeqCst),
+                "modelsState": if state.models_loading.load(std::sync::atomic::Ordering::SeqCst) {
+                    "loading".to_string()
+                } else {
+                    match state.models_failed.read().await.as_ref() {
+                        Some(err) => format!("failed: {err}"),
+                        None => "ready".to_string(),
+                    }
+                }
+            })),
+            None => healthy_component(json!({
+                "pid": std::process::id(),
+                "mode": "stdio",
+                "note": "daemon runtime state is not injected in stdio mode"
+            })),
+        }
+    }
+}
+
+fn resolve_optional_path(
+    input: Option<PathBuf>,
+    env_name: &'static str,
+    field: &'static str,
+) -> Result<Option<PathBuf>, String> {
+    match input {
+        Some(path) => validate_non_empty_path(field, path).map(Some),
+        None => match std::env::var(env_name) {
+            Ok(raw) => validate_non_empty_path(env_name, PathBuf::from(raw)).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(err) => Err(format!("{env_name} must be readable UTF-8: {err}")),
+        },
+    }
+}
+
+fn validate_non_empty_path(field: &'static str, path: PathBuf) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{field} must be a non-empty path"));
+    }
+    Ok(path)
+}
+
+fn healthy_component(data: serde_json::Value) -> serde_json::Value {
+    json!({
+        "status": "healthy",
+        "data": data
+    })
+}
+
+fn unavailable_component(
+    error_code: impl Into<String>,
+    message: impl Into<String>,
+    source: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "status": "unavailable",
+        "errorCode": error_code.into(),
+        "message": message.into(),
+        "source": source
+    })
+}
+
+fn disabled_component(message: impl Into<String>) -> serde_json::Value {
+    json!({
+        "status": "disabled",
+        "message": message.into()
+    })
+}
+
+fn aggregate_status(components: &BTreeMap<String, serde_json::Value>) -> &'static str {
+    let unavailable_count = components
+        .values()
+        .filter(|component| component.get("status").and_then(Value::as_str) == Some("unavailable"))
+        .count();
+    if unavailable_count == 0 {
+        "healthy"
+    } else if unavailable_count == components.len() {
+        "unavailable"
+    } else {
+        "degraded"
+    }
+}
+
+fn unix_now_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .map_err(|err| format!("system clock is before UNIX_EPOCH: {err}"))
+}
+
+fn resolve_heal_db_path(input: Option<PathBuf>) -> Result<PathBuf, String> {
+    match input {
+        Some(path) => Ok(path),
+        None => match std::env::var(ENV_HEAL_DB) {
+            Ok(path) => Ok(PathBuf::from(path)),
+            Err(std::env::VarError::NotPresent) => Err(format!(
+                "dbPath or {ENV_HEAL_DB} is required; refusing to guess a self-healing database path"
+            )),
+            Err(err) => Err(format!("{ENV_HEAL_DB} must be readable UTF-8: {err}")),
+        },
+    }
+}
+
+fn run_heal_status(
+    db_path: &std::path::Path,
+) -> Result<serde_json::Value, Box<context_graph_mejepa::heal::HealError>> {
+    let store = HealRocksStore::open(db_path)?;
+    let cf_counts = all_referenced_cf_names()
+        .iter()
+        .map(|cf| Ok(((*cf).to_string(), store.count_cf(cf)?)))
+        .collect::<
+            Result<std::collections::BTreeMap<_, _>, Box<context_graph_mejepa::heal::HealError>>,
+        >()?;
+    let mut active_pointers = std::collections::BTreeMap::new();
+    for name in [
+        "active_weights",
+        "active_calibration",
+        "active_constellation",
+    ] {
+        if let Some(bytes) =
+            store.get_cf(CF_MEJEPA_ACTIVE_POINTERS, &encode_active_pointer_key(name)?)?
+        {
+            let value: ActivePointerValue = decode_value(&bytes)?;
+            active_pointers.insert(
+                name.to_string(),
+                json!({
+                    "thetaShaOrVersionHex": hex::encode(value.theta_sha_or_version),
+                    "frozenAt": value.frozen_at
+                }),
+            );
+        }
+    }
+    let db = store.db();
+    let heal_reports_cf = db.cf_handle(CF_MEJEPA_HEAL_REPORTS).ok_or_else(|| {
+        HealError::invalid(
+            "heal_status.heal_reports_cf",
+            format!("missing column family {CF_MEJEPA_HEAL_REPORTS}"),
+        )
+    })?;
+    let mut heal_reports = Vec::new();
+    for item in db.iterator_cf(heal_reports_cf, IteratorMode::Start) {
+        let (key, value) = item.map_err(HealError::from)?;
+        if is_holdout_rotation_event_key(key.as_ref()) {
+            continue;
+        }
+        heal_reports.push(decode_value::<HealReport>(&value)?);
+    }
+    let latest_report = heal_reports
+        .into_iter()
+        .max_by_key(|report| report.witness_chain_offset)
+        .map(|report| {
+            json!({
+                "modeWinner": report.mode_winner,
+                "weightsShaWinner": hex::encode(report.weights_sha_winner),
+                "evaluationSummarySha": hex::encode(report.evaluation_summary_sha),
+                "witnessChainOffset": report.witness_chain_offset,
+                "promotionLatencySeconds": report.promotion_latency_seconds,
+                "statusChange": report.status_change,
+                "triggerReason": report.trigger_reason
+            })
+        });
+    Ok(json!({
+        "dbPath": db_path,
+        "cfCounts": cf_counts,
+        "activePointers": active_pointers,
+        "latestHealReport": latest_report
+    }))
+}
+
+fn run_rollback_to(
+    db_path: &std::path::Path,
+    witness_chain_path: PathBuf,
+    target_witness_chain_offset: u64,
+) -> Result<serde_json::Value, Box<context_graph_mejepa::heal::HealError>> {
+    let store = HealRocksStore::open(db_path)?;
+    let mut witness_chain = WitnessChainAppender::new(witness_chain_path.clone())?;
+    let lock = Arc::new(Mutex::new(PromotionLockState::default()));
+    let mut promoter = AbcPromoter::try_new(0.1, PromotionGate::default())?;
+    let evidence = promoter.rollback_to(
+        target_witness_chain_offset,
+        store.clone(),
+        &mut witness_chain,
+        lock,
+    )?;
+    Ok(json!({
+        "targetWitnessChainOffset": evidence.target_witness_chain_offset,
+        "rolledBackTo": hex::encode(evidence.rolled_back_to),
+        "newWitnessChainOffset": evidence.new_witness_chain_offset,
+        "dbPath": db_path,
+        "witnessChainPath": witness_chain_path
+    }))
+}
+
+fn run_promote_approval(
+    db_path: &std::path::Path,
+    promotion_id: &str,
+    operator_id: &str,
+    action: PromotionApprovalAction,
+    operator_reason: &str,
+    two_person_rule: bool,
+) -> Result<serde_json::Value, Box<context_graph_mejepa::heal::HealError>> {
+    let store = HealRocksStore::open(db_path)?;
+    let response = apply_promotion_approval(
+        &store,
+        HealPromotionApprovalRequest {
+            promotion_id: promotion_id.to_string(),
+            operator_id: operator_id.to_string(),
+            action,
+            reason: operator_reason.to_string(),
+            two_person_rule,
+        },
+    )?;
+    Ok(json!({
+        "dbPath": db_path,
+        "promotionId": response.promotion_id,
+        "stateBefore": response.state_before,
+        "stateAfter": response.state_after,
+        "requiredDistinctApprovals": response.required_distinct_approvals,
+        "distinctApprovalCount": response.distinct_approval_count,
+        "sourceOfTruth": {
+            "cf": response.source_of_truth_cf,
+            "keyHex": response.source_of_truth_key_hex,
+            "readbackVerified": response.readback_verified
+        }
+    }))
+}
+
+fn resolve_tct_db_path(input: Option<PathBuf>) -> Result<PathBuf, String> {
+    match input {
+        Some(path) => Ok(path),
+        None => match std::env::var(ENV_TCT_DB) {
+            Ok(path) => Ok(PathBuf::from(path)),
+            Err(std::env::VarError::NotPresent) => Err(format!(
+                "dbPath or {ENV_TCT_DB} is required; refusing to guess a TCT database path"
+            )),
+            Err(err) => Err(format!("{ENV_TCT_DB} must be readable UTF-8: {err}")),
+        },
+    }
+}
+
+fn run_constellation_inspect(
+    db_path: &std::path::Path,
+    version_id: Option<&str>,
+    runtime_versions: &std::collections::BTreeMap<EmbedderId, [u8; 32]>,
+) -> Result<serde_json::Value, context_graph_mejepa_tct::TctError> {
+    let db = open_tct_rocksdb(db_path)?;
+    let store = ConstellationStore::new(db)?;
+    let version_id = match version_id {
+        Some(value) => parse_version_id(value).map_err(|err| {
+            context_graph_mejepa_tct::TctError::InvalidInput {
+                field: "versionId".to_string(),
+                detail: err,
+            }
+        })?,
+        None => store.latest_version()?,
+    };
+    let constellation = store.load(version_id, runtime_versions)?;
+    let summary = build_inspect_summary(&constellation, None);
+    serde_json::to_value(summary).map_err(context_graph_mejepa_tct::TctError::from)
+}
+
+fn infer_db_path() -> Result<PathBuf, String> {
+    std::env::var("CONTEXTGRAPH_MEJEPA_INFER_DB")
+        .map(PathBuf::from)
+        .map_err(|_| {
+            "CONTEXTGRAPH_MEJEPA_INFER_DB must point to the Phase 4 inference RocksDB; refusing to guess a database path".to_string()
+        })
+}
+
+fn resolve_optional_infer_db_path(input: Option<&PathBuf>) -> Result<PathBuf, String> {
+    match input {
+        Some(path) if path.as_os_str().is_empty() => {
+            Err("dbPath must be a non-empty path".to_string())
+        }
+        Some(path) => Ok(path.clone()),
+        None => infer_db_path(),
+    }
+}
+
+fn run_predict_what_if(db_path: &Path, request: PredictWhatIfRequest) -> AnyhowResult<Value> {
+    let repo_root = request.context.environment.repo_root.clone();
+    let disk_sha_before = file_sha_snapshot(&repo_root, &request.patch)
+        .context("read repository file SHA snapshot before what-if prediction")?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let calibration = CalibrationStore::new(db.clone(), 30)?;
+    let store = Arc::new(RocksDbInferStore::new(db.clone()));
+    let compiler = build_slot_preserving_cuda_compiler(
+        repo_root.clone(),
+        store,
+        calibration,
+        MeJepaInferConfig::default(),
+    )
+    .context("build slot-preserving CUDA ME-JEPA compiler")?;
+    let prediction = compiler
+        .compile(&request.patch, &request.context)
+        .context("compile what-if prediction")?;
+    let disk_sha_after = file_sha_snapshot(&repo_root, &request.patch)
+        .context("read repository file SHA snapshot after what-if prediction")?;
+    if disk_sha_before != disk_sha_after {
+        bail!("what-if prediction mutated at least one referenced repository file");
+    }
+
+    let compare_to_current = match request.compare_to_prediction_id {
+        Some(raw) => {
+            let prediction_id = parse_prediction_id_hex(&raw)?;
+            let prior = find_prediction_by_id(db.as_ref(), prediction_id)?;
+            json!({
+                "predictionId": raw,
+                "priorVerdict": prior.verdict,
+                "priorConfidence": prior.calibrated_confidence,
+                "newVerdict": prediction.verdict,
+                "newConfidence": prediction.calibrated_confidence,
+                "confidenceDelta": prediction.calibrated_confidence - prior.calibrated_confidence,
+                "failureModeDelta": prediction.predicted_failure_modes.len() as i64
+                    - prior.predicted_failure_modes.len() as i64,
+                "securityConcernDelta": prediction.predicted_security_concerns.len() as i64
+                    - prior.predicted_security_concerns.len() as i64
+            })
+        }
+        None => Value::Null,
+    };
+
+    Ok(json!({
+        "prediction": prediction,
+        "compareToCurrent": compare_to_current,
+        "diskShaBefore": disk_sha_before,
+        "diskShaAfter": disk_sha_after,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "calibrationCf": CF_MEJEPA_CALIBRATION_HISTORY,
+            "trainCertCf": CF_MEJEPA_TRAIN_CERTS,
+            "repositoryRoot": repo_root.display().to_string(),
+            "persistedPrediction": false
+        }
+    }))
+}
+
+fn run_search_latent_actions(
+    db_path: &Path,
+    request: SearchLatentActionsRequest,
+) -> AnyhowResult<Value> {
+    let repo_root = request.context.environment.repo_root.clone();
+    let disk_sha_before = file_sha_snapshot_for_candidates(&repo_root, &request.candidates)
+        .context("read repository file SHA snapshot before latent action search")?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let calibration = CalibrationStore::new(db.clone(), 30)?;
+    let store = Arc::new(RocksDbInferStore::new(db));
+    let compiler = build_slot_preserving_cuda_compiler(
+        repo_root.clone(),
+        store,
+        calibration,
+        MeJepaInferConfig::default(),
+    )
+    .context("build slot-preserving CUDA ME-JEPA compiler")?;
+    let search = search_latent_actions(
+        &compiler,
+        &request.context,
+        request.candidates.clone(),
+        request.config,
+    )
+    .context("search latent action candidates")?;
+    let disk_sha_after = file_sha_snapshot_for_candidates(&repo_root, &request.candidates)
+        .context("read repository file SHA snapshot after latent action search")?;
+    if disk_sha_before != disk_sha_after {
+        bail!("latent action search mutated at least one referenced repository file");
+    }
+
+    Ok(json!({
+        "selectedCandidateId": search.selected_candidate_id.clone(),
+        "search": search,
+        "diskShaBefore": disk_sha_before,
+        "diskShaAfter": disk_sha_after,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "calibrationCf": CF_MEJEPA_CALIBRATION_HISTORY,
+            "trainCertCf": CF_MEJEPA_TRAIN_CERTS,
+            "repositoryRoot": repo_root.display().to_string(),
+            "persistedPrediction": false,
+            "latentSearch": true,
+            "tool": tool_names::MEJEPA_SEARCH_LATENT_ACTIONS
+        }
+    }))
+}
+
+fn run_rank_candidates(db_path: &Path, request: RankCandidatesRequest) -> AnyhowResult<Value> {
+    let repo_root = request.context.environment.repo_root.clone();
+    let disk_sha_before = file_sha_snapshot_for_candidates(&repo_root, &request.candidates)
+        .context("read repository file SHA snapshot before candidate ranking")?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let calibration = CalibrationStore::new(db.clone(), 30)?;
+    let store = Arc::new(RocksDbInferStore::new(db));
+    let compiler = build_slot_preserving_cuda_compiler(
+        repo_root.clone(),
+        store,
+        calibration,
+        MeJepaInferConfig::default(),
+    )
+    .context("build slot-preserving CUDA ME-JEPA compiler")?;
+    let ranking = rank_counterfactual_candidates(
+        &compiler,
+        &request.context,
+        request.candidates.clone(),
+        request.config,
+    )
+    .context("rank counterfactual candidates")?;
+    let disk_sha_after = file_sha_snapshot_for_candidates(&repo_root, &request.candidates)
+        .context("read repository file SHA snapshot after candidate ranking")?;
+    if disk_sha_before != disk_sha_after {
+        bail!("candidate ranking mutated at least one referenced repository file");
+    }
+
+    Ok(json!({
+        "selectedCandidateId": ranking.selected_candidate_id.clone(),
+        "ranking": ranking,
+        "diskShaBefore": disk_sha_before,
+        "diskShaAfter": disk_sha_after,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "calibrationCf": CF_MEJEPA_CALIBRATION_HISTORY,
+            "trainCertCf": CF_MEJEPA_TRAIN_CERTS,
+            "repositoryRoot": repo_root.display().to_string(),
+            "persistedPrediction": false,
+            "latentSearchBackend": true,
+            "objectiveSafetyApplied": true,
+            "tool": tool_names::MEJEPA_RANK_CANDIDATES
+        }
+    }))
+}
+
+fn run_mincut_panel(db_path: &Path, request: MincutPanelRequest) -> AnyhowResult<Value> {
+    let created_at_unix_ms = now_unix_ms()?;
+    let db = open_mincut_rocksdb(db_path).context("open ME-JEPA mincut RocksDB")?;
+    let report = mejepa_mincut_panel(
+        Some(db.as_ref()),
+        request.graph_source,
+        request.options,
+        created_at_unix_ms,
+    )
+    .context("run deterministic ME-JEPA mincut panel")?;
+    if request.persist {
+        write_mincut_report_sync_readback(db.as_ref(), &report).context("persist mincut report")?;
+    }
+    let persisted_readback_equal = if request.persist {
+        let readback = read_mincut_report(db.as_ref(), &report.report_id)
+            .context("read persisted mincut report")?
+            .ok_or_else(|| anyhow!("mincut report row missing after write"))?;
+        readback == report
+    } else {
+        false
+    };
+    if request.persist && !persisted_readback_equal {
+        bail!("MEJEPA_MINCUT_REPORT_READBACK_MISMATCH");
+    }
+    Ok(json!({
+        "report": report,
+        "persistedReadbackEqual": persisted_readback_equal,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "mincutReportCf": CF_MEJEPA_MINCUT_REPORTS,
+            "persisted": request.persist,
+            "tool": tool_names::MEJEPA_MINCUT_PANEL,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_check_bedrock_consistency(
+    db_path: &Path,
+    request: CheckBedrockConsistencyRequest,
+) -> AnyhowResult<Value> {
+    let db = open_infer_rocksdb(db_path).context("open ME-JEPA inference RocksDB")?;
+    let report = bedrock_consistency_for_patch_diff(
+        db.as_ref(),
+        &request.patch,
+        request.threshold,
+        request.top_k,
+    )
+    .context("run deterministic bedrock consistency verifier")?;
+    Ok(json!({
+        "report": report,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "foundationalityCf": CF_MEJEPA_CHUNK_FOUNDATIONALITY,
+            "tool": tool_names::MEJEPA_CHECK_BEDROCK_CONSISTENCY,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_library_foundationality(
+    db_path: &Path,
+    request: LibraryFoundationalityRequest,
+) -> AnyhowResult<Value> {
+    let db = open_infer_rocksdb(db_path).context("open ME-JEPA inference RocksDB")?;
+    let library_id = request
+        .library_id
+        .as_deref()
+        .map(LibraryId::parse_slug)
+        .transpose()
+        .context("parse library id")?;
+    let report =
+        read_library_foundationality_report(db.as_ref(), library_id.as_ref(), request.top_k)
+            .context("read persisted library foundationality report")?;
+    Ok(json!({
+        "report": report,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "libraryId": request.library_id,
+            "libraryRegistryCf": CF_MEJEPA_LIBRARY_REGISTRY,
+            "libraryFoundationalityCf": CF_MEJEPA_LIBRARY_FOUNDATIONALITY,
+            "crossLibraryReferencesCf": CF_MEJEPA_CROSS_LIBRARY_REFERENCES,
+            "tool": tool_names::MEJEPA_LIBRARY_FOUNDATIONALITY,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_propose_instrument(
+    db_path: &Path,
+    request: ProposeInstrumentRequest,
+) -> AnyhowResult<Value> {
+    let created_at_unix_ms = now_unix_ms()?;
+    let db = open_infer_rocksdb(db_path).context("open ME-JEPA inference RocksDB")?;
+    let report = propose_instruments_from_db(db.as_ref(), request.config, created_at_unix_ms)
+        .context("propose ME-JEPA instrument candidates")?;
+    let write_summary = if request.persist && !report.proposals.is_empty() {
+        Some(
+            write_instrument_proposals_sync_readback(db.as_ref(), &report.proposals)
+                .context("persist instrument proposals")?,
+        )
+    } else {
+        None
+    };
+    let persisted_readback_count = if request.persist {
+        read_instrument_proposals(db.as_ref())
+            .context("read persisted instrument proposals")?
+            .len()
+    } else {
+        0
+    };
+    Ok(json!({
+        "report": report,
+        "writeSummary": write_summary,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "instrumentProposalCf": CF_MEJEPA_INSTRUMENT_PROPOSALS,
+            "persisted": request.persist,
+            "persistedReadbackCount": persisted_readback_count,
+            "tool": tool_names::MEJEPA_PROPOSE_INSTRUMENT,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_pending_embedder_proposals(
+    db_path: &Path,
+    request: PendingEmbedderProposalsRequest,
+) -> AnyhowResult<Value> {
+    let created_at_unix_ms = now_unix_ms()?;
+    let db = open_infer_rocksdb(db_path).context("open ME-JEPA inference RocksDB")?;
+    let report =
+        propose_embedder_proposals_from_db(db.as_ref(), request.config, created_at_unix_ms)
+            .context("compose pending ME-JEPA embedder proposals")?;
+    let write_summary = if request.persist && !report.proposals.is_empty() {
+        Some(
+            write_embedder_proposals_sync_readback(db.as_ref(), &report.proposals)
+                .context("persist embedder proposals")?,
+        )
+    } else {
+        None
+    };
+    let persisted_readback_count = if request.persist {
+        read_embedder_proposals(db.as_ref())
+            .context("read persisted embedder proposals")?
+            .len()
+    } else {
+        0
+    };
+    Ok(json!({
+        "report": report,
+        "writeSummary": write_summary,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "embedderProposalCf": CF_MEJEPA_EMBEDDER_PROPOSALS,
+            "persisted": request.persist,
+            "persistedReadbackCount": persisted_readback_count,
+            "tool": tool_names::MEJEPA_PENDING_EMBEDDER_PROPOSALS,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_pending_embedder_approvals(
+    db_path: &Path,
+) -> Result<serde_json::Value, Box<context_graph_mejepa::heal::HealError>> {
+    let store = HealRocksStore::open(db_path)?;
+    let pending = pending_dynamic_embedder_promotions(&store)?;
+    Ok(json!({
+        "pendingApprovals": pending,
+        "pendingCount": pending.len(),
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "cf": CF_MEJEPA_MODEL_PROMOTIONS,
+            "tool": tool_names::MEJEPA_PENDING_EMBEDDER_APPROVALS,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_promote_instrument_proposal(
+    db_path: &Path,
+    request: PromoteInstrumentProposalRequest,
+) -> AnyhowResult<Value> {
+    let proposal_id = parse_instrument_proposal_id_hex(&request.proposal_id)?;
+    let decided_at_unix_ms = now_unix_ms()?;
+    let db = open_infer_rocksdb(db_path).context("open ME-JEPA inference RocksDB")?;
+    let proposal = promote_instrument_proposal(
+        db.as_ref(),
+        proposal_id,
+        request.decision,
+        request.observed_holdout_delta,
+        request.min_delta_required,
+        decided_at_unix_ms,
+    )
+    .context("promote instrument proposal")?;
+    let readback = read_instrument_proposal(db.as_ref(), proposal_id)
+        .context("read promoted instrument proposal")?
+        .ok_or_else(|| anyhow!("instrument proposal missing after promotion"))?;
+    let persisted_readback_equal = readback == proposal;
+    if !persisted_readback_equal {
+        bail!("MEJEPA_INSTRUMENT_PROPOSAL_READBACK_MISMATCH");
+    }
+    Ok(json!({
+        "proposal": proposal,
+        "persistedReadbackEqual": persisted_readback_equal,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "instrumentProposalCf": CF_MEJEPA_INSTRUMENT_PROPOSALS,
+            "proposalId": request.proposal_id,
+            "tool": tool_names::MEJEPA_PROMOTE_INSTRUMENT_PROPOSAL,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_explain_prediction(
+    db_path: &Path,
+    request: ExplainPredictionRequest,
+) -> AnyhowResult<Value> {
+    if request.fingerprint_reference_limit > 100 {
+        bail!("fingerprintReferenceLimit must be <= 100");
+    }
+    let prediction_id = parse_prediction_id_hex(&request.prediction_id)?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let prediction = find_prediction_by_id(db.as_ref(), prediction_id)?;
+    let saliency = saliency_by_chunk(&prediction)?;
+    let q4_trust_gate =
+        context_graph_mejepa::default_q4_trust_gate_report().context("evaluate Q4 trust gate")?;
+    let trusted_q4 = context_graph_mejepa::trusted_q4_consequences(&prediction, &q4_trust_gate);
+    let q4 = q4_projection(&prediction, &q4_trust_gate, &trusted_q4);
+    let fingerprint_references = if request.include_fingerprint_references {
+        fingerprint_references_for_prediction(
+            db.as_ref(),
+            &prediction,
+            request.fingerprint_reference_limit as usize,
+        )?
+    } else {
+        Vec::new()
+    };
+    Ok(json!({
+        "predictionId": request.prediction_id,
+        "verdict": prediction.verdict,
+        "matchedFingerprint": &prediction.matched_fingerprint,
+        "unknownCandidateId": prediction.unknown_candidate_id.map(hex::encode),
+        "fingerprintEvidenceReason": fingerprint_evidence_reason(db.as_ref(), &prediction)?,
+        "fingerprintReferences": fingerprint_references,
+        "diagnosticConsequences": diagnostic_consequence_projection(
+            &prediction,
+            DIAGNOSTIC_CONSEQUENCE_LIMIT
+        ),
+        "slotAttributionSummary": slot_attribution_summary(&prediction, 12),
+        "slotAttributionsCompact": compact_slot_attributions(&prediction, 12),
+        "confidenceInterval": prediction.confidence_interval,
+        "calibratedConfidence": prediction.calibrated_confidence,
+        "oodScore": prediction.ood_score,
+        "saliencyByChunk": saliency,
+        "topFailureModes": prediction.predicted_failure_modes,
+        "predictedFailedTests": prediction.predicted_failed_tests,
+        "predictedWorks": prediction.predicted_works,
+        "predictedUncoveredPaths": prediction.predicted_uncovered_paths,
+        "predictedFlakyTests": prediction.predicted_flaky_tests,
+        "guardViolations": prediction.guard_violations,
+        "perSlotOodReasons": prediction.per_slot_ood_reasons,
+        "edgeCases": prediction.predicted_edge_cases,
+        "latentBugs": prediction.predicted_latent_bugs,
+        "techDebt": prediction.predicted_tech_debt_added,
+        "deadCode": prediction.predicted_dead_code,
+        "redundantCode": prediction.predicted_redundant_code,
+        "perfRegressions": prediction.predicted_perf_regressions,
+        "securityConcerns": prediction.predicted_security_concerns,
+        "accuracyDegradations": prediction.predicted_accuracy_degradations,
+        "costRegressions": prediction.predicted_cost_regressions,
+        "reasoningClass": prediction.predicted_reasoning_class,
+        "q4": q4,
+        "q4TrustGate": &q4_trust_gate,
+        "trustedQ4Consequences": &trusted_q4,
+        "agentClaimGraph": prediction.agent_claim_graph,
+        "claimReconciliation": prediction.claim_reconciliation,
+        "realityImpact": prediction.reality_impact,
+        "provenance": prediction.provenance,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "cf": CF_MEJEPA_LIVE_PREDICTIONS,
+            "predictionId": request.prediction_id
+        }
+    }))
+}
+
+fn run_inspect_prediction(
+    db_path: &Path,
+    request: InspectPredictionRequest,
+) -> AnyhowResult<Value> {
+    let prediction_id = parse_prediction_id_hex(&request.prediction_id)?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let row = find_prediction_row_by_id(db.as_ref(), prediction_id)?;
+    let ood_calibration_rows =
+        context_graph_mejepa::count_prediction_ood_calibration_rows(db.as_ref())
+            .context("count CF_MEJEPA_OOD_CALIBRATIONS rows")?;
+    let trust =
+        context_graph_mejepa::assess_prediction_trust(&row.prediction, ood_calibration_rows);
+    let saliency = saliency_by_chunk(&row.prediction)?;
+    let contributing_chunks = inspect_contributing_chunks(db.as_ref(), &row.prediction, &saliency)?;
+    let granger_mean = mean_prediction_attestation(&row.prediction.granger_attestations);
+    let q4_trust_gate =
+        context_graph_mejepa::default_q4_trust_gate_report().context("evaluate Q4 trust gate")?;
+    let trusted_q4 = context_graph_mejepa::trusted_q4_consequences(&row.prediction, &q4_trust_gate);
+    let q4 = q4_projection(&row.prediction, &q4_trust_gate, &trusted_q4);
+
+    Ok(json!({
+        "predictionId": request.prediction_id,
+        "predictionIdentity": {
+            "predictionId": hex::encode(row.prediction.prediction_id),
+            "taskId": row.prediction.task_id.0.clone(),
+            "sessionId": hex::encode(row.prediction.session_id),
+            "language": row.prediction.language,
+            "createdAtUnixMs": row.prediction.created_at_unix_ms
+        },
+        "witnessHash": hex::encode(row.prediction.witness_hash.0),
+        "sourcePanelSha": hex::encode(row.prediction.source_panel_sha),
+        "versions": {
+            "predictorVersion": row.prediction.provenance.predictor_version.clone(),
+            "constellationVersion": row.prediction.provenance.constellation_version.clone(),
+            "calibrationVersion": row.prediction.provenance.calibration_version.clone(),
+            "activePointer": row.prediction.provenance.active_pointer.clone(),
+            "predictionCalibrationVersion": row.prediction.calibration_version.clone()
+        },
+        "conformalTrace": {
+            "steps": [
+                {
+                    "step": "load_prediction_row",
+                    "cf": CF_MEJEPA_LIVE_PREDICTIONS,
+                    "keyHex": hex::encode(&row.key),
+                    "valueSha256": row.value_sha256_hex,
+                    "valueBytes": row.value_len
+                },
+                {
+                    "step": "load_calibration_version",
+                    "calibrationVersion": row.prediction.calibration_version.clone()
+                },
+                {
+                    "step": "assemble_outcome_set",
+                    "alpha": row.prediction.outcome_set.alpha,
+                    "tau": row.prediction.outcome_set.tau,
+                    "entropyBits": row.prediction.outcome_set.entropy_bits,
+                    "outcomes": row.prediction.outcome_set.outcomes.clone()
+                },
+                {
+                    "step": "compute_confidence_interval",
+                    "method": row.prediction.confidence_interval.method,
+                    "coverageTarget": row.prediction.confidence_interval.coverage_target,
+                    "empiricalCoverage": row.prediction.confidence_interval.empirical_coverage,
+                    "lower": row.prediction.confidence_interval.lower,
+                    "upper": row.prediction.confidence_interval.upper,
+                    "width": row.prediction.confidence_interval.width()
+                },
+                {
+                    "step": "calibrate_confidence",
+                    "predictedOraclePass": row.prediction.predicted_oracle_pass,
+                    "oodScore": row.prediction.ood_score,
+                    "grangerAttestationMean": granger_mean,
+                    "calibratedConfidence": row.prediction.calibrated_confidence,
+                    "degradedStatus": row.prediction.degraded_status
+                }
+            ],
+            "predictedTestPass": row.prediction.predicted_test_pass.clone(),
+            "grangerAttestations": row.prediction.granger_attestations.clone()
+        },
+        "tctTrace": {
+            "constellationVersion": row.prediction.provenance.constellation_version.clone(),
+            "guardViolations": row.prediction.guard_violations.clone(),
+            "guardViolationCount": row.prediction.guard_violations.len(),
+            "perSlotOodReasons": row.prediction.per_slot_ood_reasons.clone(),
+            "perSlotOodReasonCount": row.prediction.per_slot_ood_reasons.len(),
+            "slotAttributionCount": row.prediction.slot_attributions.len(),
+            "slotAttributionSummary": slot_attribution_summary(&row.prediction, 16)
+        },
+        "diagnosticConsequences": diagnostic_consequence_projection(
+            &row.prediction,
+            DIAGNOSTIC_CONSEQUENCE_LIMIT
+        ),
+        "contributingChunks": contributing_chunks,
+        "slotAttributions": row.prediction.slot_attributions.clone(),
+        "q4": q4,
+        "q4TrustGate": &q4_trust_gate,
+        "trustedQ4Consequences": &trusted_q4,
+        "prediction": row.prediction,
+        "predictionTrust": trust,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "livePredictionCf": CF_MEJEPA_LIVE_PREDICTIONS,
+            "livePredictionKeyHex": hex::encode(&row.key),
+            "livePredictionValueSha256": row.value_sha256_hex,
+            "oodCalibrationCf": CF_MEJEPA_OOD_CALIBRATIONS,
+            "oodCalibrationRows": ood_calibration_rows,
+            "ddaSignalsCf": CF_MEJEPA_DDA_SIGNALS,
+            "readbackVerified": true
+        }
+    }))
+}
+
+fn run_consequence_trace(db_path: &Path, request: ConsequenceTraceRequest) -> AnyhowResult<Value> {
+    let prediction_id = parse_prediction_id_hex(&request.prediction_id)?;
+    if let Some(consequence_id) = &request.consequence_id {
+        validate_consequence_id(consequence_id)?;
+    }
+    let chunk_source_index = load_optional_chunk_source_index(
+        request.chunk_source_jsonl.as_deref(),
+        request.require_source_bytes,
+    )?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let row = find_prediction_row_by_id(db.as_ref(), prediction_id)?;
+    let mistake_linkage = mistake_linkage_for_prediction(db.as_ref(), prediction_id)?;
+    let projection = diagnostic_consequence_projection(&row.prediction, usize::MAX);
+    let all_items = projection["items"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("diagnostic consequence projection did not return items array"))?;
+    let all_items = all_items
+        .into_iter()
+        .map(|item| {
+            enrich_consequence_sources(
+                attach_mistake_linkage(item, &mistake_linkage),
+                chunk_source_index.as_ref(),
+                request.require_source_bytes,
+            )
+        })
+        .collect::<AnyhowResult<Vec<_>>>()?;
+    let (items, filtered) = match request.consequence_id.as_deref() {
+        Some(target) => {
+            let matching = all_items
+                .iter()
+                .filter(|item| item["consequenceId"].as_str() == Some(target))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                bail!(
+                    "consequenceId={} was not found for predictionId={}",
+                    target,
+                    request.prediction_id
+                );
+            }
+            (matching, true)
+        }
+        None => (all_items, false),
+    };
+    Ok(json!({
+        "schemaVersion": DIAGNOSTIC_CONSEQUENCE_SCHEMA_VERSION,
+        "predictionId": request.prediction_id,
+        "requestedConsequenceId": request.consequence_id,
+        "filtered": filtered,
+        "consequenceCount": items.len(),
+        "items": items,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "cf": CF_MEJEPA_LIVE_PREDICTIONS,
+            "mistakeCf": CF_MEJEPA_MISTAKE_LOG,
+            "skillLifecycleAuditCf": CF_MEJEPA_SKILL_LIFECYCLE_AUDIT,
+            "livePredictionKeyHex": hex::encode(&row.key),
+            "livePredictionValueSha256": row.value_sha256_hex,
+            "livePredictionValueBytes": row.value_len,
+            "readbackVerified": true,
+            "traceMaterialization": "derived_from_persisted_reality_prediction",
+            "chunkSourceJsonl": request
+                .chunk_source_jsonl
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "sourceByteRequirement": request.require_source_bytes,
+            "tool": tool_names::MEJEPA_CONSEQUENCE_TRACE,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn run_evidence_to_consequences(
+    db_path: &Path,
+    request: EvidenceToConsequencesRequest,
+) -> AnyhowResult<Value> {
+    if request.limit == 0 || request.limit > 500 {
+        bail!("limit must be between 1 and 500");
+    }
+    let selector = EvidenceConsequenceSelector::from_request(&request)?;
+    let chunk_source_index = load_optional_chunk_source_index(
+        request.chunk_source_jsonl.as_deref(),
+        request.require_source_bytes,
+    )?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let rows = scan_prediction_rows(db.as_ref())?;
+    let mut matches = Vec::new();
+    let mut scanned_consequences = 0usize;
+    for row in &rows {
+        let mistake_linkage = mistake_linkage_for_prediction(
+            db.as_ref(),
+            PredictionId(row.prediction.prediction_id),
+        )?;
+        let projection = diagnostic_consequence_projection(&row.prediction, usize::MAX);
+        let items = projection["items"].as_array().ok_or_else(|| {
+            anyhow!("diagnostic consequence projection did not return items array")
+        })?;
+        for item in items {
+            scanned_consequences += 1;
+            let Some(match_scope) = consequence_matches_selector(item, &selector) else {
+                continue;
+            };
+            matches.push(json!({
+                "predictionId": hex::encode(row.prediction.prediction_id),
+                "consequenceId": item["consequenceId"].clone(),
+                "kind": item["kind"].clone(),
+                "target": item["target"].clone(),
+                "badOutcome": item["badOutcome"].clone(),
+                "score": item["score"].clone(),
+                "whyBad": item["whyBad"].clone(),
+                "evidenceStatus": item["evidenceStatus"].clone(),
+                "matchScope": match_scope,
+                "directEvidence": enrich_direct_evidence_sources(
+                    item["directEvidence"].clone(),
+                    chunk_source_index.as_ref(),
+                    request.require_source_bytes,
+                )?,
+                "predictionContext": item["predictionContext"].clone(),
+                "mistakeLinkage": mistake_linkage.clone(),
+                "sourceOfTruth": {
+                    "livePredictionKeyHex": hex::encode(&row.key),
+                    "livePredictionValueSha256": row.value_sha256_hex,
+                    "livePredictionValueBytes": row.value_len
+                }
+            }));
+            if matches.len() == request.limit as usize {
+                break;
+            }
+        }
+        if matches.len() == request.limit as usize {
+            break;
+        }
+    }
+    Ok(json!({
+        "schemaVersion": DIAGNOSTIC_CONSEQUENCE_SCHEMA_VERSION,
+        "selector": selector.to_json(),
+        "matchCount": matches.len(),
+        "limit": request.limit,
+        "scannedPredictionRows": rows.len(),
+        "scannedConsequences": scanned_consequences,
+        "matches": matches,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "cf": CF_MEJEPA_LIVE_PREDICTIONS,
+            "mistakeCf": CF_MEJEPA_MISTAKE_LOG,
+            "skillLifecycleAuditCf": CF_MEJEPA_SKILL_LIFECYCLE_AUDIT,
+            "readbackVerified": true,
+            "lookupMaterialization": "scan_derived_from_persisted_reality_predictions",
+            "chunkSourceJsonl": request
+                .chunk_source_jsonl
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "sourceByteRequirement": request.require_source_bytes,
+            "tool": tool_names::MEJEPA_EVIDENCE_TO_CONSEQUENCES,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvidenceConsequenceSelector {
+    Chunk(String),
+    Skill(String),
+    Constellation(String),
+}
+
+impl EvidenceConsequenceSelector {
+    fn from_request(request: &EvidenceToConsequencesRequest) -> AnyhowResult<Self> {
+        let mut selectors = Vec::new();
+        if let Some(chunk_id) = non_empty_selector("chunkId", request.chunk_id.as_deref())? {
+            selectors.push(Self::Chunk(chunk_id.to_string()));
+        }
+        if let Some(skill_id) = non_empty_selector("skillId", request.skill_id.as_deref())? {
+            selectors.push(Self::Skill(skill_id.to_string()));
+        }
+        if let Some(constellation_id) =
+            non_empty_selector("constellationId", request.constellation_id.as_deref())?
+        {
+            selectors.push(Self::Constellation(constellation_id.to_string()));
+        }
+        if selectors.len() != 1 {
+            bail!("exactly one of chunkId, skillId, or constellationId is required");
+        }
+        Ok(selectors.remove(0))
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Chunk(value) => json!({"kind": "chunkId", "value": value}),
+            Self::Skill(value) => json!({"kind": "skillId", "value": value}),
+            Self::Constellation(value) => json!({"kind": "constellationId", "value": value}),
+        }
+    }
+}
+
+fn non_empty_selector<'a>(name: &str, value: Option<&'a str>) -> AnyhowResult<Option<&'a str>> {
+    match value {
+        Some(raw) if raw.trim().is_empty() => bail!("{name} must be non-empty when provided"),
+        Some(raw) => Ok(Some(raw)),
+        None => Ok(None),
+    }
+}
+
+fn validate_consequence_id(value: &str) -> AnyhowResult<()> {
+    let Some(hex_value) = value.strip_prefix("consequence:") else {
+        bail!("consequenceId must start with consequence:");
+    };
+    if hex_value.len() != 24 || !hex_value.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        bail!("consequenceId must be consequence: followed by 24 hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn consequence_matches_selector(
+    consequence: &Value,
+    selector: &EvidenceConsequenceSelector,
+) -> Option<&'static str> {
+    match selector {
+        EvidenceConsequenceSelector::Chunk(chunk_id) => {
+            if json_array_contains_str(&consequence["directEvidence"]["chunkIds"], chunk_id) {
+                return Some("direct_evidence.chunk_ids");
+            }
+            None
+        }
+        EvidenceConsequenceSelector::Skill(skill_id) => {
+            if json_array_contains_str(&consequence["directEvidence"]["activeSkillIds"], skill_id) {
+                return Some("direct_evidence.active_skill_ids");
+            }
+            if json_array_contains_str(
+                &consequence["directEvidence"]["activeHigherAbilityIds"],
+                skill_id,
+            ) {
+                return Some("direct_evidence.active_higher_ability_ids");
+            }
+            if json_array_contains_str(
+                &consequence["predictionContext"]["labelContext"]["activeSkillIds"],
+                skill_id,
+            ) {
+                return Some("prediction_context.active_skill_ids");
+            }
+            if json_array_contains_str(
+                &consequence["predictionContext"]["labelContext"]["activeHigherAbilityIds"],
+                skill_id,
+            ) {
+                return Some("prediction_context.active_higher_ability_ids");
+            }
+            None
+        }
+        EvidenceConsequenceSelector::Constellation(constellation_id) => {
+            if consequence["directEvidence"]["constellation"]["relationshipPatternId"].as_str()
+                == Some(constellation_id)
+            {
+                return Some("direct_evidence.constellation.relationship_pattern_id");
+            }
+            if consequence["predictionContext"]["constellation"]["relationshipPatternId"].as_str()
+                == Some(constellation_id)
+            {
+                return Some("prediction_context.constellation.relationship_pattern_id");
+            }
+            if consequence["predictionContext"]["constellation"]["version"].as_str()
+                == Some(constellation_id)
+            {
+                return Some("prediction_context.constellation.version");
+            }
+            None
+        }
+    }
+}
+
+fn json_array_contains_str(value: &Value, needle: &str) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(needle)))
+}
+
+fn attach_mistake_linkage(mut consequence: Value, mistake_linkage: &Value) -> Value {
+    if let Some(object) = consequence.as_object_mut() {
+        object.insert("mistakeLinkage".to_string(), mistake_linkage.clone());
+    }
+    consequence
+}
+
+fn load_optional_chunk_source_index(
+    path: Option<&Path>,
+    require_source_bytes: bool,
+) -> AnyhowResult<Option<context_graph_mejepa_train::ChunkSourceIndex>> {
+    match path {
+        Some(path) => context_graph_mejepa_train::load_chunk_source_index_jsonl(path)
+            .with_context(|| format!("load chunk source JSONL {}", path.display()))
+            .map(Some),
+        None if require_source_bytes => {
+            bail!("requireSourceBytes=true requires chunkSourceJsonl")
+        }
+        None => Ok(None),
+    }
+}
+
+fn enrich_consequence_sources(
+    mut consequence: Value,
+    source_index: Option<&context_graph_mejepa_train::ChunkSourceIndex>,
+    require_source_bytes: bool,
+) -> AnyhowResult<Value> {
+    let direct = consequence["directEvidence"].clone();
+    let enriched = enrich_direct_evidence_sources(direct, source_index, require_source_bytes)?;
+    if let Some(object) = consequence.as_object_mut() {
+        object.insert("directEvidence".to_string(), enriched);
+    }
+    Ok(consequence)
+}
+
+fn enrich_direct_evidence_sources(
+    mut direct_evidence: Value,
+    source_index: Option<&context_graph_mejepa_train::ChunkSourceIndex>,
+    require_source_bytes: bool,
+) -> AnyhowResult<Value> {
+    let chunk_ids = direct_evidence["chunkIds"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (source_status, source_rows, missing_chunks, missing_source_bytes) =
+        chunk_source_rows_for_trace(&chunk_ids, source_index);
+    if require_source_bytes
+        && !chunk_ids.is_empty()
+        && (!missing_chunks.is_empty()
+            || !missing_source_bytes.is_empty()
+            || source_index.is_none())
+    {
+        bail!(
+            "source byte provenance missing for direct evidence chunks: missingChunks={:?} missingSourceBytes={:?} sourceIndexProvided={}",
+            missing_chunks,
+            missing_source_bytes,
+            source_index.is_some()
+        );
+    }
+    if let Some(object) = direct_evidence.as_object_mut() {
+        object.insert("sourceStatus".to_string(), json!(source_status));
+        object.insert("sourceRows".to_string(), Value::Array(source_rows));
+        object.insert("missingSourceChunkIds".to_string(), json!(missing_chunks));
+        object.insert(
+            "missingSourceBytesChunkIds".to_string(),
+            json!(missing_source_bytes),
+        );
+    }
+    Ok(direct_evidence)
+}
+
+fn chunk_source_rows_for_trace(
+    chunk_ids: &[String],
+    source_index: Option<&context_graph_mejepa_train::ChunkSourceIndex>,
+) -> (&'static str, Vec<Value>, Vec<String>, Vec<String>) {
+    if chunk_ids.is_empty() {
+        return ("no_direct_chunks", Vec::new(), Vec::new(), Vec::new());
+    }
+    let Some(index) = source_index else {
+        return (
+            "source_index_not_provided",
+            Vec::new(),
+            chunk_ids.to_vec(),
+            Vec::new(),
+        );
+    };
+    let mut source_rows = Vec::new();
+    let mut missing_chunks = Vec::new();
+    let mut missing_source_bytes = Vec::new();
+    for chunk_id in chunk_ids {
+        let Some(rows) = index.rows_by_chunk_id.get(chunk_id) else {
+            missing_chunks.push(chunk_id.clone());
+            continue;
+        };
+        for row in rows {
+            if row.source_text.is_none() {
+                missing_source_bytes.push(row.chunk_id.clone());
+            }
+            source_rows.push(json!({
+                "chunkId": row.chunk_id.clone(),
+                "filePath": row.file_path.clone(),
+                "byteSpan": row.byte_span,
+                "sourceText": row.source_text.clone(),
+                "sourceTextSha256": row.source_text_sha256.clone(),
+                "sourceBytes": row.source_text.as_ref().map(|text| text.len()),
+                "sourceRowKey": row.source_row_key.clone()
+            }));
+        }
+    }
+    let status = if missing_chunks.is_empty() && missing_source_bytes.is_empty() {
+        "source_bytes_verified"
+    } else {
+        "source_bytes_incomplete"
+    };
+    (status, source_rows, missing_chunks, missing_source_bytes)
+}
+
+fn mistake_linkage_for_prediction(db: &DB, prediction_id: PredictionId) -> AnyhowResult<Value> {
+    let mistake_rows = context_graph_mejepa_train::read_all_mistake_log_rows(db)
+        .context("read CF_MEJEPA_MISTAKE_LOG for consequence trace linkage")?
+        .into_iter()
+        .filter(|row| row.prediction_id == prediction_id)
+        .collect::<Vec<_>>();
+    let lifecycle_rows = context_graph_mejepa_train::read_all_skill_lifecycle_audit_rows(db)
+        .context("read CF_MEJEPA_SKILL_LIFECYCLE_AUDIT for consequence trace linkage")?;
+    let mut linked = Vec::new();
+    for row in mistake_rows {
+        let audits = lifecycle_rows
+            .iter()
+            .filter(|audit| audit.mistake_id.as_deref() == Some(row.mistake_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        linked.push(json!({
+            "mistakeId": row.mistake_id,
+            "predictionId": hex::encode(row.prediction_id.0),
+            "predictedVerdict": row.predicted_verdict,
+            "groundTruthVerdict": row.ground_truth_verdict,
+            "truthSource": row.truth_source,
+            "codeStateKey": row.code_state_key,
+            "namedFailureMode": row.named_failure_mode,
+            "acceptedLabelIds": row.accepted_label_ids,
+            "activeSkillIds": row.active_skill_ids,
+            "activeHigherAbilityIds": row.active_higher_ability_ids,
+            "sourceMembershipKeys": row.source_membership_keys,
+            "labelSignatureHash": row.label_signature_hash,
+            "skillSignatureHash": row.skill_signature_hash,
+            "abilitySignatureHash": row.ability_signature_hash,
+            "membershipSignatureHash": row.membership_signature_hash,
+            "failureEvidenceSetIds": row.failure_evidence_set_ids,
+            "replayRowKey": row.replay_row_key,
+            "createdAtUnixMs": row.created_at_unix_ms,
+            "lifecycleAuditCount": audits.len(),
+            "lifecycleAudits": audits
+        }));
+    }
+    let status = if linked.is_empty() {
+        "no_observed_refutation_row"
+    } else {
+        "refuted_or_observed_mistake_rows_found"
+    };
+    Ok(json!({
+        "status": status,
+        "mistakeCount": linked.len(),
+        "mistakeIds": linked
+            .iter()
+            .filter_map(|row| row["mistakeId"].as_str().map(str::to_string))
+            .collect::<Vec<_>>(),
+        "rows": linked,
+        "sourceCfs": [CF_MEJEPA_MISTAKE_LOG, CF_MEJEPA_SKILL_LIFECYCLE_AUDIT]
+    }))
+}
+
+fn q4_projection(
+    prediction: &RealityPrediction,
+    trust_gate: &context_graph_mejepa::Q4TrustGateReport,
+    trusted: &context_graph_mejepa::TrustedQ4Consequences,
+) -> Value {
+    json!({
+        "rawObservations": q4_raw_observations(prediction),
+        "slotAttributionsByHead": q4_slot_attributions_by_head(prediction),
+        "trustGate": trust_gate,
+        "trustedConsequences": trusted,
+        "policy": "raw Q4 observations are display-only historical data and never influence trust decisions under the Q4 doctrine freeze"
+    })
+}
+
+fn diagnostic_consequence_projection(prediction: &RealityPrediction, limit: usize) -> Value {
+    let mut items = Vec::new();
+
+    if matches!(
+        prediction.verdict,
+        Verdict::Fail | Verdict::OutOfDistribution | Verdict::Abstain | Verdict::GuardRejected
+    ) {
+        let chunks = adverse_verdict_chunks(prediction);
+        let why_bad = adverse_verdict_reason(prediction);
+        let evidence_status = if chunks.is_empty() {
+            "insufficient_direct_evidence"
+        } else {
+            "direct_evidence"
+        };
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q2_verdict",
+                target: "oracle_verdict".to_string(),
+                bad_outcome: format!("{:?}", prediction.verdict),
+                why_bad,
+                chunks,
+                evidence_status,
+                score: prediction.calibrated_confidence,
+                source_payload: json!({
+                    "verdict": prediction.verdict,
+                    "predictedOraclePass": prediction.predicted_oracle_pass,
+                    "calibratedConfidence": prediction.calibrated_confidence,
+                    "oodScore": prediction.ood_score,
+                    "unknownCandidateId": prediction.unknown_candidate_id.map(hex::encode),
+                    "activeLearningBranch": if matches!(prediction.verdict, Verdict::OutOfDistribution) {
+                        if prediction.unknown_candidate_id.is_some() {
+                            "unknown_candidate_id_present"
+                        } else {
+                            "unknown_candidate_id_missing"
+                        }
+                    } else {
+                        "not_ood"
+                    }
+                }),
+            },
+        );
+    }
+
+    for failed in &prediction.predicted_failed_tests {
+        if !matches!(
+            failed.predicted_outcome,
+            context_graph_mejepa::TestOutcome::Fail | context_graph_mejepa::TestOutcome::Error
+        ) {
+            continue;
+        }
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q2_predicted_failed_test",
+                target: failed.test_id.0.clone(),
+                bad_outcome: format!("{:?}", failed.predicted_outcome),
+                why_bad: failed.why.explanation.clone(),
+                chunks: vec![failed.why.chunk.clone()],
+                evidence_status: "direct_evidence",
+                score: failed.confidence,
+                source_payload: json!({
+                "testId": failed.test_id.0,
+                "currentOutcome": failed.current_outcome,
+                "predictedOutcome": failed.predicted_outcome,
+                "deltaKind": failed.delta_kind,
+                "rootCauseClass": failed.why.root_cause_class,
+                "failureClass": failed.why.failure_class
+                }),
+            },
+        );
+    }
+
+    for mode in &prediction.predicted_failure_modes {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q3_failure_mode",
+                target: mode.chunk.0.clone(),
+                bad_outcome: format!("{:?}", mode.failure_class),
+                why_bad: mode.explanation.clone(),
+                chunks: vec![mode.chunk.clone()],
+                evidence_status: "direct_evidence",
+                score: mode.confidence,
+                source_payload: json!({
+                "failureClass": mode.failure_class,
+                "rootCauseClass": mode.root_cause_class,
+                "severity": mode.severity,
+                "lineRange": mode.line_range,
+                "contributingEmbedders": mode.contributing_embedders
+                }),
+            },
+        );
+    }
+
+    for guard in &prediction.guard_violations {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q2_guard_violation",
+                target: guard.chunk.0.clone(),
+                bad_outcome: guard.centroid_id.clone(),
+                why_bad: format!(
+                    "guard violation: embedder={} cosine={} threshold_tau_m={} deficit={}",
+                    guard.embedder.0, guard.cosine, guard.threshold_tau_m, guard.deficit
+                ),
+                chunks: vec![guard.chunk.clone()],
+                evidence_status: "direct_evidence",
+                score: guard.deficit.clamp(0.0, 1.0),
+                source_payload: json!({
+                "embedder": guard.embedder,
+                "centroidId": guard.centroid_id,
+                "cosine": guard.cosine,
+                "thresholdTauM": guard.threshold_tau_m,
+                "deficit": guard.deficit
+                }),
+            },
+        );
+    }
+
+    for uncovered in &prediction.predicted_uncovered_paths {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q4_pass_with_uncovered_path_risk",
+                target: uncovered.chunk.0.clone(),
+                bad_outcome: "uncovered_path".to_string(),
+                why_bad: format!(
+                    "uncovered path risk: {} (defect_probability={} confidence={})",
+                    uncovered.path_description, uncovered.defect_probability, uncovered.confidence
+                ),
+                chunks: vec![uncovered.chunk.clone()],
+                evidence_status: "direct_risk_evidence",
+                score: uncovered.defect_probability.max(uncovered.confidence),
+                source_payload: json!({
+                    "pathDescription": uncovered.path_description.clone(),
+                    "lineRange": uncovered.line_range,
+                    "defectProbability": uncovered.defect_probability,
+                    "confidence": uncovered.confidence,
+                    "evidence": uncovered.evidence.clone(),
+                    "policy": "pass-with-risk consequence derived from persisted RealityPrediction; no Q4 trust promotion implied"
+                }),
+            },
+        );
+    }
+
+    for edge in &prediction.predicted_edge_cases {
+        if edge.covered_by_test && edge.confidence < 0.5 {
+            continue;
+        }
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q4_pass_with_edge_risk",
+                target: edge.chunk.0.clone(),
+                bad_outcome: format!("{:?}", edge.edge_class),
+                why_bad: format!(
+                    "edge-case risk: {:?} at {:?}; covered_by_test={} confidence={}",
+                    edge.edge_class, edge.line_range, edge.covered_by_test, edge.confidence
+                ),
+                chunks: vec![edge.chunk.clone()],
+                evidence_status: "direct_risk_evidence",
+                score: edge.confidence,
+                source_payload: json!({
+                    "edgeClass": edge.edge_class,
+                    "lineRange": edge.line_range,
+                    "triggeringInputDescription": edge.triggering_input_description.clone(),
+                    "coveredByTest": edge.covered_by_test,
+                    "confidence": edge.confidence,
+                    "policy": "pass-with-risk consequence derived from persisted RealityPrediction; no Q4 trust promotion implied"
+                }),
+            },
+        );
+    }
+
+    for bug in &prediction.predicted_latent_bugs {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q4_pass_with_latent_bug_risk",
+                target: bug.chunk.0.clone(),
+                bad_outcome: format!("{:?}", bug.bug_class),
+                why_bad: bug.explanation.clone(),
+                chunks: vec![bug.chunk.clone()],
+                evidence_status: "direct_risk_evidence",
+                score: bug.confidence,
+                source_payload: json!({
+                    "bugClass": bug.bug_class,
+                    "lineRange": bug.line_range,
+                    "confidence": bug.confidence,
+                    "severity": bug.severity,
+                    "explanation": bug.explanation.clone(),
+                    "policy": "pass-with-risk consequence derived from persisted RealityPrediction; no Q4 trust promotion implied"
+                }),
+            },
+        );
+    }
+
+    for debt in &prediction.predicted_tech_debt_added {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q4_pass_with_tech_debt_risk",
+                target: debt.chunk.0.clone(),
+                bad_outcome: format!("{:?}", debt.debt_class),
+                why_bad: debt.explanation.clone(),
+                chunks: vec![debt.chunk.clone()],
+                evidence_status: "direct_risk_evidence",
+                score: severity_score(debt.severity),
+                source_payload: json!({
+                    "debtClass": debt.debt_class,
+                    "lineRange": debt.line_range,
+                    "severity": debt.severity,
+                    "explanation": debt.explanation.clone(),
+                    "policy": "pass-with-risk consequence derived from persisted RealityPrediction; no Q4 trust promotion implied"
+                }),
+            },
+        );
+    }
+
+    for dead_code in &prediction.predicted_dead_code {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q4_pass_with_dead_code_risk",
+                target: dead_code.chunk.0.clone(),
+                bad_outcome: format!("{:?}", dead_code.kind),
+                why_bad: dead_code.reason.clone(),
+                chunks: vec![dead_code.chunk.clone()],
+                evidence_status: "direct_risk_evidence",
+                score: 0.65,
+                source_payload: json!({
+                    "kind": dead_code.kind,
+                    "lineRange": dead_code.line_range,
+                    "reason": dead_code.reason.clone(),
+                    "policy": "pass-with-risk consequence derived from persisted RealityPrediction; no Q4 trust promotion implied"
+                }),
+            },
+        );
+    }
+
+    for redundancy in &prediction.predicted_redundant_code {
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q4_pass_with_redundancy_risk",
+                target: redundancy.chunk.0.clone(),
+                bad_outcome: format!("{:?}", redundancy.kind),
+                why_bad: redundancy.explanation.clone(),
+                chunks: std::iter::once(redundancy.chunk.clone())
+                    .chain(redundancy.also_at.iter().cloned())
+                    .collect(),
+                evidence_status: "direct_risk_evidence",
+                score: redundancy.similarity,
+                source_payload: json!({
+                    "kind": redundancy.kind,
+                    "alsoAt": redundancy.also_at.clone(),
+                    "similarity": redundancy.similarity,
+                    "explanation": redundancy.explanation.clone(),
+                    "policy": "pass-with-risk consequence derived from persisted RealityPrediction; no Q4 trust promotion implied"
+                }),
+            },
+        );
+    }
+
+    for (idx, reconciliation) in prediction.claim_reconciliation.iter().enumerate() {
+        if !reconciliation_status_is_bad(reconciliation.status) {
+            continue;
+        }
+        push_diagnostic_consequence(
+            &mut items,
+            prediction,
+            DiagnosticConsequenceInput {
+                kind: "q1_claim_reconciliation",
+                target: format!("claim:{idx}"),
+                bad_outcome: format!("{:?}", reconciliation.status),
+                why_bad: format!(
+                    "claim reconciliation status {:?} means the claimed durable bytes are not cleanly confirmed",
+                    reconciliation.status
+                ),
+                chunks: Vec::new(),
+                evidence_status: "direct_claim_evidence",
+                score: 1.0,
+                source_payload: json!({
+                "claim": reconciliation.claim,
+                "status": reconciliation.status,
+                "evidenceRows": reconciliation.evidence
+                }),
+            },
+        );
+    }
+
+    if let Some(impact) = &prediction.reality_impact {
+        if impact.prediction_correctness != context_graph_mejepa::PredictionCorrectness::Aligned {
+            push_diagnostic_consequence(
+                &mut items,
+                prediction,
+                DiagnosticConsequenceInput {
+                    kind: "q5_reality_impact",
+                    target: "shift_log_replay".to_string(),
+                    bad_outcome: format!("{:?}", impact.prediction_correctness),
+                    why_bad: format!(
+                        "Q5 replay classified prediction as {:?}; predicted files/tests and observed shift-log reality diverged",
+                        impact.prediction_correctness
+                    ),
+                    chunks: prediction.covered_chunks.clone(),
+                    evidence_status: if prediction.covered_chunks.is_empty() {
+                        "insufficient_direct_evidence"
+                    } else {
+                        "direct_shift_replay_evidence"
+                    },
+                    score: 1.0,
+                    source_payload: json!({
+                    "predictionCorrectness": impact.prediction_correctness,
+                    "predictedFilesChanged": impact.predicted_files_changed,
+                    "observedFilesChanged": impact.observed_files_changed,
+                    "unexpectedFilesChanged": impact.unexpected_files_changed,
+                    "predictedTestOutcomes": impact.predicted_test_outcomes,
+                    "observedTestOutcomes": impact.observed_test_outcomes
+                    }),
+                },
+            );
+        }
+    }
+
+    let truncated = items.len().saturating_sub(limit);
+    items.truncate(limit);
+    json!({
+        "schemaVersion": DIAGNOSTIC_CONSEQUENCE_SCHEMA_VERSION,
+        "predictionId": hex::encode(prediction.prediction_id),
+        "source": "derived_from_persisted_reality_prediction",
+        "sourceCf": CF_MEJEPA_LIVE_PREDICTIONS,
+        "diagnosticInvariant": "bad consequence predictions must include the evidence path that makes them bad",
+        "consequenceCount": items.len(),
+        "truncatedCount": truncated,
+        "items": items
+    })
+}
+
+struct DiagnosticConsequenceInput {
+    kind: &'static str,
+    target: String,
+    bad_outcome: String,
+    why_bad: String,
+    chunks: Vec<ChunkId>,
+    evidence_status: &'static str,
+    score: f32,
+    source_payload: Value,
+}
+
+fn push_diagnostic_consequence(
+    items: &mut Vec<Value>,
+    prediction: &RealityPrediction,
+    input: DiagnosticConsequenceInput,
+) {
+    let source_hash = diagnostic_source_payload_hash(&input.source_payload);
+    items.push(json!({
+        "consequenceId": diagnostic_consequence_id(
+            prediction,
+            input.kind,
+            &input.target,
+            &source_hash
+        ),
+        "kind": input.kind,
+        "target": input.target,
+        "badOutcome": input.bad_outcome,
+        "score": input.score.clamp(0.0, 1.0),
+        "whyBad": input.why_bad,
+        "evidenceStatus": input.evidence_status,
+        "directEvidence": diagnostic_direct_evidence(prediction, &input.chunks),
+        "predictionContext": diagnostic_prediction_context(prediction),
+        "sourcePayloadSha256": source_hash,
+        "sourcePayload": input.source_payload
+    }));
+}
+
+fn diagnostic_consequence_id(
+    prediction: &RealityPrediction,
+    kind: &str,
+    target: &str,
+    source_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prediction.prediction_id);
+    hasher.update(kind.as_bytes());
+    hasher.update(target.as_bytes());
+    hasher.update(source_hash.as_bytes());
+    format!("consequence:{}", &hex::encode(hasher.finalize())[..24])
+}
+
+fn diagnostic_source_payload_hash(source_payload: &Value) -> String {
+    let bytes = serde_json::to_vec(source_payload).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
+}
+
+fn severity_score(severity: context_graph_mejepa::Severity) -> f32 {
+    match severity {
+        context_graph_mejepa::Severity::Info => 0.20,
+        context_graph_mejepa::Severity::Low => 0.35,
+        context_graph_mejepa::Severity::Medium => 0.55,
+        context_graph_mejepa::Severity::High => 0.80,
+        context_graph_mejepa::Severity::Critical => 0.95,
+    }
+}
+
+fn diagnostic_direct_evidence(prediction: &RealityPrediction, chunks: &[ChunkId]) -> Value {
+    let chunk_ids = chunks
+        .iter()
+        .map(|chunk| chunk.0.clone())
+        .collect::<Vec<_>>();
+    let direct_skill_ids = direct_skill_ids_for_chunks(prediction, chunks);
+    let direct_ability_ids = direct_higher_ability_ids_for_chunks(prediction, chunks);
+    json!({
+        "chunkIds": chunk_ids,
+        "slotAttributions": diagnostic_slot_attributions(prediction, chunks, 12),
+        "activeSkillIds": direct_skill_ids,
+        "activeHigherAbilityIds": direct_ability_ids,
+        "constellation": {
+            "relationshipPatternId": prediction
+                .constellation_intelligence
+                .as_ref()
+                .and_then(|evidence| evidence.relationship_pattern_id.clone())
+        }
+    })
+}
+
+fn diagnostic_prediction_context(prediction: &RealityPrediction) -> Value {
+    json!({
+        "coveredChunkIds": prediction
+            .covered_chunks
+            .iter()
+            .map(|chunk| chunk.0.clone())
+            .collect::<Vec<_>>(),
+        "coveredChunkCount": prediction.covered_chunks.len(),
+        "labelContext": {
+            "acceptedLabelIds": prediction.label_context.accepted_label_ids,
+            "codeStateKey": prediction.label_context.code_state_key,
+            "failureEvidenceSetIds": prediction.label_context.failure_evidence_set_ids,
+            "activeSkillIds": prediction.label_context.active_skill_ids,
+            "activeHigherAbilityIds": prediction.label_context.active_higher_ability_ids,
+            "sourceMembershipKeys": prediction.label_context.source_membership_keys,
+            "labelSignatureHash": prediction.label_context.label_signature_hash,
+            "skillSignatureHash": prediction.label_context.skill_signature_hash,
+            "abilitySignatureHash": prediction.label_context.ability_signature_hash,
+            "membershipSignatureHash": prediction.label_context.membership_signature_hash
+        },
+        "calibration": {
+            "version": prediction.calibration_version,
+            "provenanceCalibrationVersion": prediction.provenance.calibration_version,
+            "bucket": prediction
+                .label_context
+                .code_state_key
+                .clone()
+                .unwrap_or_else(|| "unresolved_calibration_bucket".to_string()),
+            "predictedOraclePass": prediction.predicted_oracle_pass,
+            "calibratedConfidence": prediction.calibrated_confidence,
+            "oodScore": prediction.ood_score,
+            "baselineSignals": prediction.granger_attestations
+        },
+        "activeLearning": {
+            "unknownCandidateId": prediction.unknown_candidate_id.map(hex::encode),
+            "matchedFingerprint": prediction.matched_fingerprint.clone()
+        },
+        "constellation": {
+            "version": prediction.provenance.constellation_version,
+            "relationshipPatternId": prediction
+                .constellation_intelligence
+                .as_ref()
+                .and_then(|evidence| evidence.relationship_pattern_id.clone()),
+            "intelligence": prediction.constellation_intelligence
+        },
+        "closestExemplars": prediction.closest_exemplars.iter().take(5).collect::<Vec<_>>()
+    })
+}
+
+fn direct_skill_ids_for_chunks(prediction: &RealityPrediction, chunks: &[ChunkId]) -> Vec<String> {
+    if chunks.is_empty() || !has_chunk_linked_constellation_skill_attribution(prediction, chunks) {
+        return Vec::new();
+    }
+    prediction.label_context.active_skill_ids.clone()
+}
+
+fn direct_higher_ability_ids_for_chunks(
+    prediction: &RealityPrediction,
+    chunks: &[ChunkId],
+) -> Vec<String> {
+    if chunks.is_empty() || !has_chunk_linked_constellation_skill_attribution(prediction, chunks) {
+        return Vec::new();
+    }
+    prediction.label_context.active_higher_ability_ids.clone()
+}
+
+fn has_chunk_linked_constellation_skill_attribution(
+    prediction: &RealityPrediction,
+    chunks: &[ChunkId],
+) -> bool {
+    prediction.slot_attributions.iter().any(|attribution| {
+        attribution.source == SlotAttributionSource::ConstellationSkill
+            && attribution
+                .chunk
+                .as_ref()
+                .is_some_and(|chunk| chunks.iter().any(|target| target == chunk))
+    })
+}
+
+fn diagnostic_slot_attributions(
+    prediction: &RealityPrediction,
+    chunks: &[ChunkId],
+    limit: usize,
+) -> Vec<Value> {
+    let mut attributions = prediction
+        .slot_attributions
+        .iter()
+        .filter(|attribution| diagnostic_attribution_matches(attribution, chunks))
+        .collect::<Vec<_>>();
+    attributions.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.slot_id.cmp(&right.slot_id))
+            .then_with(|| slot_source_name(left.source).cmp(slot_source_name(right.source)))
+    });
+    attributions
+        .into_iter()
+        .take(limit)
+        .map(compact_slot_attribution)
+        .collect()
+}
+
+fn diagnostic_attribution_matches(
+    attribution: &SlotAttributionEvidence,
+    chunks: &[ChunkId],
+) -> bool {
+    let relevant_polarity = matches!(
+        attribution.polarity,
+        SlotAttributionPolarity::Violating
+            | SlotAttributionPolarity::Missing
+            | SlotAttributionPolarity::Stale
+            | SlotAttributionPolarity::Q5Impact
+    );
+    let relevant_source = matches!(
+        attribution.source,
+        SlotAttributionSource::FailureMode
+            | SlotAttributionSource::GuardViolation
+            | SlotAttributionSource::PerSlotOod
+            | SlotAttributionSource::FailureFingerprint
+            | SlotAttributionSource::Q5Replay
+            | SlotAttributionSource::ClaimReconciliation
+            | SlotAttributionSource::ConstellationSkill
+    );
+    if !(relevant_polarity || relevant_source) {
+        return false;
+    }
+    chunks.is_empty()
+        || attribution
+            .chunk
+            .as_ref()
+            .is_some_and(|chunk| chunks.iter().any(|target| target == chunk))
+}
+
+fn adverse_verdict_chunks(prediction: &RealityPrediction) -> Vec<ChunkId> {
+    let mut out = Vec::new();
+    for mode in &prediction.predicted_failure_modes {
+        push_unique_chunk(&mut out, &mode.chunk);
+    }
+    for failed in &prediction.predicted_failed_tests {
+        push_unique_chunk(&mut out, &failed.why.chunk);
+    }
+    for guard in &prediction.guard_violations {
+        push_unique_chunk(&mut out, &guard.chunk);
+    }
+    for reason in &prediction.per_slot_ood_reasons {
+        if let Some(chunk) = &reason.chunk {
+            push_unique_chunk(&mut out, chunk);
+        }
+    }
+    out
+}
+
+fn push_unique_chunk(out: &mut Vec<ChunkId>, chunk: &ChunkId) {
+    if !out.iter().any(|existing| existing == chunk) {
+        out.push(chunk.clone());
+    }
+}
+
+fn adverse_verdict_reason(prediction: &RealityPrediction) -> String {
+    if let Some(mode) = prediction.predicted_failure_modes.first() {
+        return mode.explanation.clone();
+    }
+    if let Some(failed) = prediction.predicted_failed_tests.first() {
+        return failed.why.explanation.clone();
+    }
+    if let Some(guard) = prediction.guard_violations.first() {
+        return format!(
+            "guard violation in {} from embedder {} with deficit {}",
+            guard.chunk.0, guard.embedder.0, guard.deficit
+        );
+    }
+    if let Some(reason) = prediction.per_slot_ood_reasons.first() {
+        return format!("per-slot OOD reason: {:?}", reason);
+    }
+    if prediction.predicted_failure_modes.is_empty()
+        && prediction.predicted_failed_tests.is_empty()
+        && prediction.guard_violations.is_empty()
+    {
+        return format!(
+            "verdict {:?} is bad, but no direct chunk/test/guard consequence evidence was persisted; trace is marked insufficient_direct_evidence",
+            prediction.verdict
+        );
+    }
+    format!(
+        "verdict {:?} requires operator attention",
+        prediction.verdict
+    )
+}
+
+fn reconciliation_status_is_bad(status: ReconciliationStatus) -> bool {
+    matches!(
+        status,
+        ReconciliationStatus::Missing
+            | ReconciliationStatus::UnexpectedSideEffect
+            | ReconciliationStatus::SuperficialMatch
+            | ReconciliationStatus::AmbiguousRef
+            | ReconciliationStatus::Unverifiable
+            | ReconciliationStatus::ModifiedUnexpectedly
+            | ReconciliationStatus::Ambiguous
+    )
+}
+
+fn q4_raw_observations(prediction: &RealityPrediction) -> Value {
+    json!({
+        "perfRegressions": &prediction.predicted_perf_regressions,
+        "securityConcerns": &prediction.predicted_security_concerns,
+        "accuracyDegradations": &prediction.predicted_accuracy_degradations,
+        "costRegressions": &prediction.predicted_cost_regressions,
+        "reasoningClass": prediction.predicted_reasoning_class,
+        "counts": {
+            "perf": prediction.predicted_perf_regressions.len(),
+            "security": prediction.predicted_security_concerns.len(),
+            "accuracy": prediction.predicted_accuracy_degradations.len(),
+            "cost": prediction.predicted_cost_regressions.len(),
+            "reasoning": 1
+        },
+        "trustedForDecision": false
+    })
+}
+
+fn slot_attribution_summary(prediction: &RealityPrediction, limit: usize) -> Value {
+    let mut by_polarity = BTreeMap::new();
+    let mut by_source = BTreeMap::new();
+    let mut by_slot = BTreeMap::new();
+    let mut rejection_evidence_count = 0usize;
+    let mut q4_count = 0usize;
+    let mut q5_count = 0usize;
+    for attribution in &prediction.slot_attributions {
+        *by_polarity
+            .entry(slot_polarity_name(attribution.polarity).to_string())
+            .or_insert(0usize) += 1;
+        *by_source
+            .entry(slot_source_name(attribution.source).to_string())
+            .or_insert(0usize) += 1;
+        *by_slot.entry(attribution.slot_id.clone()).or_insert(0usize) += 1;
+        if matches!(
+            attribution.polarity,
+            SlotAttributionPolarity::Violating
+                | SlotAttributionPolarity::Missing
+                | SlotAttributionPolarity::Stale
+        ) {
+            rejection_evidence_count += 1;
+        }
+        if attribution.source == SlotAttributionSource::Q4Head {
+            q4_count += 1;
+        }
+        if attribution.source == SlotAttributionSource::Q5Replay {
+            q5_count += 1;
+        }
+    }
+    json!({
+        "schemaVersion": context_graph_mejepa::SLOT_ATTRIBUTION_SCHEMA_VERSION,
+        "predictionId": hex::encode(prediction.prediction_id),
+        "count": prediction.slot_attributions.len(),
+        "byPolarity": by_polarity,
+        "bySource": by_source,
+        "bySlot": by_slot,
+        "rejectionEvidenceCount": rejection_evidence_count,
+        "q4ConcernCount": q4_count,
+        "q5ImpactCount": q5_count,
+        "top": compact_slot_attributions(prediction, limit),
+        "fullRecordField": "prediction.slot_attributions"
+    })
+}
+
+fn compact_slot_attributions(prediction: &RealityPrediction, limit: usize) -> Vec<Value> {
+    let mut items = prediction
+        .slot_attributions
+        .iter()
+        .collect::<Vec<&SlotAttributionEvidence>>();
+    items.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.slot_id.cmp(&right.slot_id))
+            .then_with(|| slot_source_name(left.source).cmp(slot_source_name(right.source)))
+    });
+    items
+        .into_iter()
+        .take(limit)
+        .map(compact_slot_attribution)
+        .collect()
+}
+
+fn compact_slot_attribution(attribution: &SlotAttributionEvidence) -> Value {
+    json!({
+        "slotId": &attribution.slot_id,
+        "embedder": &attribution.embedder,
+        "chunk": &attribution.chunk,
+        "polarity": slot_polarity_name(attribution.polarity),
+        "source": slot_source_name(attribution.source),
+        "score": attribution.score,
+        "threshold": attribution.threshold,
+        "margin": attribution.margin,
+        "reason": &attribution.reason,
+        "relationshipSlotId": &attribution.relationship_slot_id,
+        "relatedFingerprintId": &attribution.related_fingerprint_id,
+        "activeLearningCandidateId": attribution.active_learning_candidate_id.map(hex::encode),
+        "qHead": &attribution.q_head,
+        "impactKind": &attribution.impact_kind,
+        "evidence": &attribution.evidence
+    })
+}
+
+fn q4_slot_attributions_by_head(prediction: &RealityPrediction) -> Value {
+    let mut by_head: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for attribution in &prediction.slot_attributions {
+        if attribution.source != SlotAttributionSource::Q4Head {
+            continue;
+        }
+        let head = attribution
+            .q_head
+            .clone()
+            .unwrap_or_else(|| "q4_unknown_head".to_string());
+        by_head
+            .entry(head)
+            .or_default()
+            .push(compact_slot_attribution(attribution));
+    }
+    json!(by_head)
+}
+
+fn slot_polarity_name(polarity: SlotAttributionPolarity) -> &'static str {
+    match polarity {
+        SlotAttributionPolarity::Supporting => "supporting",
+        SlotAttributionPolarity::Violating => "violating",
+        SlotAttributionPolarity::Missing => "missing",
+        SlotAttributionPolarity::Stale => "stale",
+        SlotAttributionPolarity::Relationship => "relationship",
+        SlotAttributionPolarity::Q4Concern => "q4_concern",
+        SlotAttributionPolarity::Q5Impact => "q5_impact",
+    }
+}
+
+fn slot_source_name(source: SlotAttributionSource) -> &'static str {
+    match source {
+        SlotAttributionSource::VerdictHead => "verdict_head",
+        SlotAttributionSource::PredictedWorks => "predicted_works",
+        SlotAttributionSource::FailureMode => "failure_mode",
+        SlotAttributionSource::GuardViolation => "guard_violation",
+        SlotAttributionSource::PerSlotOod => "per_slot_ood",
+        SlotAttributionSource::ConstellationPair => "constellation_pair",
+        SlotAttributionSource::FailureFingerprint => "failure_fingerprint",
+        SlotAttributionSource::ActiveLearningCandidate => "active_learning_candidate",
+        SlotAttributionSource::Q4Head => "q4_head",
+        SlotAttributionSource::Q5Replay => "q5_replay",
+        SlotAttributionSource::ClaimReconciliation => "claim_reconciliation",
+        SlotAttributionSource::GrangerAttestation => "granger_attestation",
+        SlotAttributionSource::AcceptedLabel => "accepted_label",
+        SlotAttributionSource::ConstellationSkill => "constellation_skill",
+    }
+}
+
+fn file_sha_snapshot(
+    repo_root: &Path,
+    patch: &PatchBundle,
+) -> AnyhowResult<BTreeMap<String, Option<String>>> {
+    let mut out = BTreeMap::new();
+    for hunk in &patch.ast_diff.hunks {
+        let full_path = repo_root.join(&hunk.path);
+        let value = match std::fs::read(&full_path) {
+            Ok(bytes) => Some(hex::encode(Sha256::digest(&bytes))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read referenced file {}", full_path.display()))
+            }
+        };
+        out.insert(hunk.path.display().to_string(), value);
+    }
+    Ok(out)
+}
+
+fn file_sha_snapshot_for_candidates(
+    repo_root: &Path,
+    candidates: &[LatentActionCandidate],
+) -> AnyhowResult<BTreeMap<String, BTreeMap<String, Option<String>>>> {
+    let mut out = BTreeMap::new();
+    for candidate in candidates {
+        if out.contains_key(&candidate.candidate_id) {
+            bail!(
+                "duplicate latent action candidate id {}",
+                candidate.candidate_id
+            );
+        }
+        out.insert(
+            candidate.candidate_id.clone(),
+            file_sha_snapshot(repo_root, &candidate.patch)?,
+        );
+    }
+    Ok(out)
+}
+
+fn saliency_by_chunk(prediction: &RealityPrediction) -> AnyhowResult<BTreeMap<String, f64>> {
+    if prediction.covered_chunks.is_empty() {
+        bail!("prediction has no covered chunks; cannot build normalized saliency map");
+    }
+    let mut weights = prediction
+        .covered_chunks
+        .iter()
+        .map(|chunk| (chunk.0.clone(), 1.0_f64))
+        .collect::<BTreeMap<_, _>>();
+    for mode in &prediction.predicted_failure_modes {
+        *weights.entry(mode.chunk.0.clone()).or_insert(0.0) += 4.0;
+    }
+    for failed in &prediction.predicted_failed_tests {
+        *weights.entry(failed.why.chunk.0.clone()).or_insert(0.0) += 3.0;
+    }
+    for item in &prediction.predicted_works {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 1.5;
+    }
+    for item in &prediction.predicted_uncovered_paths {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 2.0;
+    }
+    for item in &prediction.predicted_edge_cases {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 2.0;
+    }
+    for item in &prediction.predicted_latent_bugs {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 2.0;
+    }
+    for item in &prediction.predicted_tech_debt_added {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 1.5;
+    }
+    for item in &prediction.predicted_dead_code {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 1.0;
+    }
+    for item in &prediction.predicted_redundant_code {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 1.0;
+    }
+    for item in &prediction.predicted_perf_regressions {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 1.0;
+    }
+    for item in &prediction.predicted_security_concerns {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 4.0;
+    }
+    for item in &prediction.predicted_accuracy_degradations {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 2.0;
+    }
+    for item in &prediction.predicted_cost_regressions {
+        *weights.entry(item.chunk.0.clone()).or_insert(0.0) += 1.0;
+    }
+    let total = weights.values().sum::<f64>();
+    if !total.is_finite() || total <= 0.0 {
+        bail!("prediction saliency weight total is invalid: {total}");
+    }
+    Ok(weights
+        .into_iter()
+        .map(|(chunk, weight)| (chunk, weight / total))
+        .collect())
+}
+
+fn record_agent_feedback_in_db(
+    db_path: &std::path::Path,
+    request: RecordAgentFeedbackRequest,
+    system_cost_counters: Option<Arc<SystemCostCounters>>,
+) -> AnyhowResult<Value> {
+    let prediction_id = parse_prediction_id_hex(&request.prediction_id)?;
+    let identity = resolve_feedback_identity(
+        request.agent_id.as_deref(),
+        request.identity_attestation.as_ref(),
+        tool_names::MEJEPA_RECORD_AGENT_FEEDBACK,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    if request.agent_explanation.len() > 4096 {
+        bail!("agentExplanation exceeds 4096 bytes");
+    }
+    let agent_id = AgentId::try_new(identity.id.clone())
+        .map_err(|err| anyhow!("agentId validation failed: {err}"))?;
+    let actual_outcome = request
+        .actual_outcome
+        .map(ActualOutcomeRequest::into_actual);
+    let mut extra_structured_data = request.extra_structured_data;
+    if extra_structured_data.is_null() {
+        extra_structured_data = json!({});
+    }
+    if !extra_structured_data.is_object() {
+        bail!("extraStructuredData must be a JSON object");
+    }
+
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let prediction = find_prediction_by_id(db.as_ref(), prediction_id)?;
+    let mut ts_millis = chrono::Utc::now().timestamp_millis();
+    let feedback_id;
+    let persisted_feedback_key: Vec<u8>;
+    loop {
+        let candidate_id = feedback_id_for(
+            prediction_id,
+            &agent_id,
+            ts_millis,
+            request.feedback_kind,
+            &request.agent_explanation,
+        );
+        let candidate_key = feedback_key(prediction_id, &agent_id, ts_millis)?;
+        if db
+            .get_cf(
+                cf_handle(db.as_ref(), CF_MEJEPA_AGENT_FEEDBACK)?,
+                &candidate_key,
+            )?
+            .is_none()
+        {
+            feedback_id = candidate_id;
+            persisted_feedback_key = candidate_key;
+            break;
+        }
+        ts_millis = ts_millis
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("feedback timestamp overflow"))?;
+    }
+
+    let event = SurpriseEvent::try_new(SurpriseEvent {
+        feedback_id,
+        prediction_id,
+        agent_id: agent_id.clone(),
+        ts_millis,
+        feedback_kind: request.feedback_kind,
+        agent_explanation: request.agent_explanation,
+        actual_outcome,
+        severity: request.severity,
+        extra_structured_data,
+        witness_hash: WitnessHash(prediction.source_panel_sha),
+    })
+    .map_err(|err| anyhow!("SurpriseEvent validation failed: {err}"))?;
+
+    let mut queue = match &system_cost_counters {
+        Some(counters) => {
+            RocksDbEvalStore::new_with_system_cost_counters(db.clone(), Arc::clone(counters))
+        }
+        None => RocksDbEvalStore::new(db.clone()),
+    }
+    .context("construct RocksDbEvalStore")?
+    .load_queue()
+    .context("load active-learning queue")?
+    .unwrap_or(ActiveLearningQueueState::new(4096).context("create active-learning queue")?);
+    let queue_count_before = queue.entries.len();
+    let mut active_learning_queued = matches!(
+        event.feedback_kind,
+        FeedbackKind::Surprise | FeedbackKind::Omission
+    );
+    if active_learning_queued {
+        active_learning_queued = queue
+            .enqueue_agent_surprise_for_prediction(&prediction, event.severity)
+            .context("enqueue agent surprise")?;
+    }
+
+    persist_feedback_and_queue(
+        db.as_ref(),
+        &persisted_feedback_key,
+        &event,
+        &queue,
+        system_cost_counters.as_deref(),
+    )?;
+    let queue_entry = queue.entries.get(&prediction.task_id).cloned();
+    let sampling_weight_multiplier = 1.0 + 2.0 * event.severity.severity_score();
+    Ok(json!({
+        "status": "recorded",
+        "predictionId": hex::encode(prediction_id.0),
+        "feedbackId": hex::encode(feedback_id.0),
+        "agentId": event.agent_id.0,
+        "feedbackKind": event.feedback_kind,
+        "severity": event.severity,
+        "severityScore": event.severity.severity_score(),
+        "samplingWeightMultiplier": sampling_weight_multiplier,
+        "identity": identity_status_json(&identity),
+        "activeLearningQueued": active_learning_queued,
+        "catastrophicAlert": matches!(event.severity, SurpriseSeverity::Catastrophic),
+        "queueCountBefore": queue_count_before,
+        "queueCountAfter": queue.entries.len(),
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "feedbackCf": CF_MEJEPA_AGENT_FEEDBACK,
+            "feedbackKeyHex": hex::encode(&persisted_feedback_key),
+            "queueCf": CF_MEJEPA_ACTIVE_LEARNING_QUEUE,
+            "queueKeyHex": hex::encode(b"active")
+        },
+        "readback": {
+            "feedback": event,
+            "queueEntry": queue_entry
+        }
+    }))
+}
+
+fn record_operator_override_in_db(
+    db_path: &Path,
+    request: OperatorOverridePredictionRequest,
+) -> AnyhowResult<Value> {
+    let prediction_id = parse_prediction_id_hex(&request.prediction_id)?;
+    let identity = resolve_operator_identity(
+        &request.operator_id,
+        request.identity_attestation.as_ref(),
+        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let prediction = find_prediction_by_id(db.as_ref(), prediction_id)?;
+    let created_at_unix_ms = chrono::Utc::now().timestamp_millis();
+    let override_record = OperatorOverride::new(
+        prediction_id,
+        request.override_verdict,
+        request.reason,
+        request.operator_id,
+        created_at_unix_ms,
+    )
+    .map_err(|err| anyhow!("{err}"))?;
+    let override_count_before =
+        count_operator_overrides(db.as_ref()).map_err(|err| anyhow!("{err}"))?;
+    persist_operator_override(db.as_ref(), &override_record).map_err(|err| anyhow!("{err}"))?;
+
+    let eval_store = RocksDbEvalStore::new(db.clone()).context("construct RocksDbEvalStore")?;
+    let label = override_record.active_learning_label(prediction.task_id.clone());
+    eval_store
+        .persist_label(&label)
+        .context("persist operator override active-learning label")?;
+    db.flush_cf(cf_handle(db.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_LABELS)?)
+        .context("flush operator override active-learning label CF")?;
+    let override_readback = load_operator_override(db.as_ref(), prediction_id)
+        .map_err(|err| anyhow!("{err}"))?
+        .ok_or_else(|| anyhow!("MEJEPA_OPERATOR_OVERRIDE_READBACK_MISSING"))?;
+    let label_readback = eval_store
+        .load_label(&prediction.task_id)
+        .context("load operator override active-learning label")?
+        .ok_or_else(|| anyhow!("MEJEPA_OPERATOR_OVERRIDE_LABEL_READBACK_MISSING"))?;
+    if override_readback != override_record {
+        bail!("MEJEPA_OPERATOR_OVERRIDE_READBACK_MISMATCH");
+    }
+    if label_readback.oracle_outcome != override_record.override_verdict.oracle_outcome()
+        || label_readback.method != LabelMethod::Human
+    {
+        bail!("MEJEPA_OPERATOR_OVERRIDE_LABEL_READBACK_MISMATCH");
+    }
+    let override_count_after =
+        count_operator_overrides(db.as_ref()).map_err(|err| anyhow!("{err}"))?;
+    let flags = operator_override_flags_for_predictions(db.as_ref(), &[prediction_id])
+        .map_err(|err| anyhow!("{err}"))?;
+    let sampling_weight_multiplier =
+        context_graph_mejepa_train::learning_signal::sampling_weight(1.0, flags[0], 0.0, 0.995);
+    let task_id_string = prediction.task_id.0.clone();
+    let covered_chunks = prediction.covered_chunks.clone();
+    Ok(json!({
+        "status": "recorded",
+        "predictionId": hex::encode(prediction_id.0),
+        "taskId": task_id_string.clone(),
+        "overrideVerdict": override_record.override_verdict,
+        "operatorId": override_record.operator_id,
+        "identity": identity_status_json(&identity),
+        "samplingWeightMultiplier": sampling_weight_multiplier,
+        "operatorOverrideCountBefore": override_count_before,
+        "operatorOverrideCountAfter": override_count_after,
+        "affectedChunks": covered_chunks,
+        "report": {
+            "operatorOverrideCount": override_count_after,
+            "activeLearningLabelMethod": label_readback.method,
+            "activeLearningOracleOutcome": label_readback.oracle_outcome
+        },
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "overrideCf": CF_MEJEPA_OPERATOR_OVERRIDES,
+            "overrideKeyHex": hex::encode(prediction_id.0),
+            "labelCf": CF_MEJEPA_ACTIVE_LEARNING_LABELS,
+            "labelKey": task_id_string
+        },
+        "readback": {
+            "override": override_readback,
+            "activeLearningLabel": label_readback,
+            "overrideFlagForNextBatch": flags[0]
+        }
+    }))
+}
+
+fn operator_contributions_report_in_db(
+    db_path: &Path,
+    request: OperatorContributionsRequest,
+) -> AnyhowResult<Value> {
+    let db = open_infer_rocksdb(db_path).context("open inference RocksDB")?;
+    let report = operator_contribution_report_from_db(
+        db.as_ref(),
+        request.window,
+        request.operator_id.as_deref(),
+    )
+    .map_err(|err| anyhow!("{err}"))?;
+    let markdown = if request.format == OperatorContributionsFormat::Markdown {
+        Some(
+            render_operator_contributions_weekly_section(&report)
+                .map_err(|err| anyhow!("{err}"))?,
+        )
+    } else {
+        None
+    };
+    Ok(json!({
+        "status": "ok",
+        "format": match request.format {
+            OperatorContributionsFormat::Json => "json",
+            OperatorContributionsFormat::Markdown => "markdown",
+        },
+        "report": report,
+        "markdown": markdown,
+        "sourceOfTruth": {
+            "dbPath": db_path.display().to_string(),
+            "operatorContributionCf": CF_MEJEPA_OPERATOR_CONTRIBUTIONS,
+            "operatorFilter": request.operator_id,
+            "innerLlmInvoked": false
+        }
+    }))
+}
+
+fn identity_status_json(identity: &ResolvedAgentIdentity) -> Value {
+    json!({
+        "id": identity.id.as_str(),
+        "authenticated": identity.authenticated,
+        "configPath": identity.config_path.as_ref().map(|path| path.display().to_string()),
+        "sessionId": identity.session_id.as_deref(),
+        "nonce": identity.nonce.as_deref()
+    })
+}
+
+fn mejepa_write_error_classification<'a>(
+    message: &'a str,
+    default_kind: ToolErrorKind,
+    default_code: &'a str,
+) -> (ToolErrorKind, &'a str) {
+    if message.contains(MEJEPA_AGENT_IDENTITY_UNVERIFIED) {
+        return (ToolErrorKind::Validation, MEJEPA_AGENT_IDENTITY_UNVERIFIED);
+    }
+    if message.contains(MEJEPA_AGENT_IDENTITY_CONFIG_INVALID) {
+        return (
+            ToolErrorKind::Validation,
+            MEJEPA_AGENT_IDENTITY_CONFIG_INVALID,
+        );
+    }
+    (default_kind, default_code)
+}
+
+impl ActualOutcomeRequest {
+    fn into_actual(self) -> ActualOutcome {
+        ActualOutcome {
+            oracle_outcome: self.oracle_outcome,
+            failed_tests: self.failed_tests.into_iter().map(TestId).collect(),
+            runtime_ms: self.runtime_ms,
+            notes: self.notes,
+        }
+    }
+}
+
+fn parse_prediction_id_hex(raw: &str) -> AnyhowResult<PredictionId> {
+    if raw.len() != 32 || !raw.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        bail!("predictionId must be exactly 32 hexadecimal characters");
+    }
+    let mut bytes = [0u8; 16];
+    hex::decode_to_slice(raw, &mut bytes).context("decode predictionId")?;
+    Ok(PredictionId(bytes))
+}
+
+fn parse_instrument_proposal_id_hex(raw: &str) -> AnyhowResult<[u8; 16]> {
+    if raw.len() != 32 || !raw.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        bail!("proposalId must be exactly 32 hexadecimal characters");
+    }
+    let mut bytes = [0u8; 16];
+    hex::decode_to_slice(raw, &mut bytes).context("decode proposalId")?;
+    if bytes.iter().all(|byte| *byte == 0) {
+        bail!("proposalId must be non-zero");
+    }
+    Ok(bytes)
+}
+
+struct PredictionRow {
+    prediction: RealityPrediction,
+    key: Vec<u8>,
+    value_sha256_hex: String,
+    value_len: usize,
+}
+
+fn find_prediction_by_id(db: &DB, prediction_id: PredictionId) -> AnyhowResult<RealityPrediction> {
+    Ok(find_prediction_row_by_id(db, prediction_id)?.prediction)
+}
+
+fn fingerprint_evidence_reason(
+    db: &DB,
+    prediction: &RealityPrediction,
+) -> AnyhowResult<Option<&'static str>> {
+    if prediction.matched_fingerprint.is_some() {
+        return Ok(None);
+    }
+    if prediction.unknown_candidate_id.is_some() {
+        return Ok(Some("UNKNOWN_OOD"));
+    }
+    if prediction.verdict == context_graph_mejepa::Verdict::GuardRejected {
+        return Ok(Some("GUARD_REJECTED"));
+    }
+    let cf = cf_handle(db, context_graph_mejepa_cf::CF_MEJEPA_FAILURE_FINGERPRINTS)?;
+    let mut iter = db.iterator_cf(cf, IteratorMode::Start);
+    if iter.next().transpose()?.is_none() {
+        return Ok(Some("CATALOG_EMPTY"));
+    }
+    Ok(Some("PREDICTION_BEFORE_CATALOG"))
+}
+
+fn fingerprint_references_for_prediction(
+    db: &DB,
+    prediction: &RealityPrediction,
+    limit: usize,
+) -> AnyhowResult<Vec<FingerprintReference>> {
+    let Some(matched) = &prediction.matched_fingerprint else {
+        return Ok(Vec::new());
+    };
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let target = FingerprintId(matched.fingerprint_id);
+    let cf = cf_handle(db, CF_MEJEPA_FINGERPRINT_REFERENCES)?;
+    let mut out = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (_key, value) = item?;
+        let reference: FingerprintReference =
+            bincode::deserialize(&value).context("decode CF_MEJEPA_FINGERPRINT_REFERENCES row")?;
+        reference
+            .validate()
+            .map_err(|err| anyhow!("invalid fingerprint reference row: {err}"))?;
+        if reference.fingerprint_id == target {
+            out.push(reference);
+            if out.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn find_prediction_row_by_id(db: &DB, prediction_id: PredictionId) -> AnyhowResult<PredictionRow> {
+    let cf = cf_handle(db, CF_MEJEPA_LIVE_PREDICTIONS)?;
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = item?;
+        let prediction = decode_live_prediction_row(&key, &value)?;
+        if prediction.prediction_id == prediction_id.0 {
+            return Ok(PredictionRow {
+                prediction,
+                key: key.to_vec(),
+                value_sha256_hex: hex::encode(Sha256::digest(&value)),
+                value_len: value.len(),
+            });
+        }
+    }
+    bail!(
+        "predictionId={} was not found in CF_MEJEPA_LIVE_PREDICTIONS",
+        hex::encode(prediction_id.0)
+    )
+}
+
+fn scan_prediction_rows(db: &DB) -> AnyhowResult<Vec<PredictionRow>> {
+    let cf = cf_handle(db, CF_MEJEPA_LIVE_PREDICTIONS)?;
+    let mut rows = Vec::new();
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = item?;
+        let prediction = decode_live_prediction_row(&key, &value)?;
+        rows.push(PredictionRow {
+            prediction,
+            key: key.to_vec(),
+            value_sha256_hex: hex::encode(Sha256::digest(&value)),
+            value_len: value.len(),
+        });
+    }
+    Ok(rows)
+}
+
+fn decode_live_prediction_row(key: &[u8], value: &[u8]) -> AnyhowResult<RealityPrediction> {
+    if key.len() != 40 {
+        bail!(
+            "invalid CF_MEJEPA_LIVE_PREDICTIONS key length: expected 40, got {}",
+            key.len()
+        );
+    }
+    let prediction = decode_reality_prediction(value)
+        .map_err(|err| anyhow!("decode CF_MEJEPA_LIVE_PREDICTIONS row: {err}"))?;
+    if prediction.session_id != key[0..16] {
+        bail!("CF_MEJEPA_LIVE_PREDICTIONS key session prefix does not match payload");
+    }
+    let mut created_at = [0u8; 8];
+    created_at.copy_from_slice(&key[16..24]);
+    if prediction.created_at_unix_ms != i64::from_be_bytes(created_at) {
+        bail!("CF_MEJEPA_LIVE_PREDICTIONS key timestamp does not match payload");
+    }
+    if prediction.prediction_id != key[24..40] {
+        bail!("CF_MEJEPA_LIVE_PREDICTIONS key prediction suffix does not match payload");
+    }
+    Ok(prediction)
+}
+
+fn inspect_contributing_chunks(
+    db: &DB,
+    prediction: &RealityPrediction,
+    saliency: &BTreeMap<String, f64>,
+) -> AnyhowResult<Vec<Value>> {
+    let panel_id = PanelId(prediction.source_panel_sha);
+    let mut chunks = Vec::with_capacity(prediction.covered_chunks.len());
+    for chunk in &prediction.covered_chunks {
+        let (key, signals) = read_required_dda_signals(db, &panel_id, chunk)?;
+        let saliency_value = saliency
+            .get(&chunk.0)
+            .copied()
+            .ok_or_else(|| anyhow!("saliency missing for covered chunk {}", chunk.0))?;
+        chunks.push(json!({
+            "chunkId": chunk.0.clone(),
+            "saliency": saliency_value,
+            "panelId": hex::encode(panel_id.0),
+            "ddaSignals": {
+                "perEmbedderCosineVector": signals.per_embedder_cosine.clone(),
+                "pairwiseCosineVector": signals.pairwise_cosine_upper.clone(),
+                "pairwiseMiVector": signals.pairwise_mi_upper.clone(),
+                "blindSpotZScoreVector": signals.blind_spot_z_scores.clone()
+            },
+            "vectorDimensions": {
+                "perEmbedderCosine": signals.per_embedder_cosine.len(),
+                "pairwiseCosine": signals.pairwise_cosine_upper.len(),
+                "pairwiseMi": signals.pairwise_mi_upper.len(),
+                "blindSpotZScores": signals.blind_spot_z_scores.len()
+            },
+            "vectorNorms": {
+                "perEmbedderCosine": vector_norm_f32(&signals.per_embedder_cosine),
+                "pairwiseCosine": vector_norm_f32(&signals.pairwise_cosine_upper),
+                "pairwiseMi": vector_norm_f32(&signals.pairwise_mi_upper),
+                "blindSpotZScores": vector_norm_f32(&signals.blind_spot_z_scores)
+            },
+            "tctCellsConsulted": tct_cells_for_chunk(prediction, chunk),
+            "sourceOfTruth": {
+                "cf": CF_MEJEPA_DDA_SIGNALS,
+                "keyHex": hex::encode(key),
+                "readbackVerified": true
+            }
+        }));
+    }
+    Ok(chunks)
+}
+
+fn read_required_dda_signals(
+    db: &DB,
+    panel_id: &PanelId,
+    chunk: &ChunkId,
+) -> AnyhowResult<(Vec<u8>, DdaSignals)> {
+    let cf = cf_handle(db, CF_MEJEPA_DDA_SIGNALS)?;
+    let key = bincode::serialize(&(panel_id, chunk)).context("encode DDA signal key")?;
+    let Some(bytes) = db.get_cf(cf, &key).context("read CF_MEJEPA_DDA_SIGNALS")? else {
+        bail!(
+            "MEJEPA_INSPECT_PREDICTION_DDA_MISSING: missing CF_MEJEPA_DDA_SIGNALS row for panel_id={} chunk_id={}",
+            hex::encode(panel_id.0),
+            chunk.0
+        );
+    };
+    let signals: DdaSignals =
+        serde_json::from_slice(&bytes).context("decode CF_MEJEPA_DDA_SIGNALS row")?;
+    signals
+        .validate()
+        .map_err(|err| anyhow!("invalid CF_MEJEPA_DDA_SIGNALS row: {err}"))?;
+    Ok((key, signals))
+}
+
+fn tct_cells_for_chunk(prediction: &RealityPrediction, chunk: &ChunkId) -> Vec<Value> {
+    prediction
+        .guard_violations
+        .iter()
+        .filter(|violation| violation.chunk == *chunk)
+        .map(|violation| {
+            json!({
+                "language": prediction.language,
+                "chunkId": chunk.0.clone(),
+                "embedder": violation.embedder.0.clone(),
+                "centroidId": violation.centroid_id.clone(),
+                "cosine": violation.cosine,
+                "thresholdTauM": violation.threshold_tau_m,
+                "deficit": violation.deficit,
+                "source": "RealityPrediction.guard_violations"
+            })
+        })
+        .collect()
+}
+
+fn vector_norm_f32(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|value| {
+            let as_f64 = f64::from(*value);
+            as_f64 * as_f64
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn mean_prediction_attestation(values: &BTreeMap<String, f32>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.values().map(|value| f64::from(*value)).sum::<f64>() / values.len() as f64)
+}
+
+fn feedback_id_for(
+    prediction_id: PredictionId,
+    agent_id: &AgentId,
+    ts_millis: i64,
+    feedback_kind: FeedbackKind,
+    explanation: &str,
+) -> FeedbackId {
+    let mut hasher = Sha256::new();
+    hasher.update(prediction_id.0);
+    hasher.update(agent_id.0.as_bytes());
+    hasher.update(ts_millis.to_be_bytes());
+    hasher.update(serde_json::to_vec(&feedback_kind).unwrap_or_default());
+    hasher.update(explanation.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    FeedbackId(out)
+}
+
+fn feedback_key(
+    prediction_id: PredictionId,
+    agent_id: &AgentId,
+    ts_millis: i64,
+) -> AnyhowResult<Vec<u8>> {
+    bincode::serialize(&(prediction_id, agent_id, ts_millis)).context("encode feedback key")
+}
+
+fn persist_feedback_and_queue(
+    db: &DB,
+    feedback_key: &[u8],
+    event: &SurpriseEvent,
+    queue: &ActiveLearningQueueState,
+    system_cost_counters: Option<&SystemCostCounters>,
+) -> AnyhowResult<()> {
+    let feedback_cf = cf_handle(db, CF_MEJEPA_AGENT_FEEDBACK)?;
+    let queue_cf = cf_handle(db, CF_MEJEPA_ACTIVE_LEARNING_QUEUE)?;
+    let evictions_cf = cf_handle(db, CF_MEJEPA_ACTIVE_LEARNING_EVICTIONS)?;
+    let ood_cf = cf_handle(db, CF_MEJEPA_OOD_ESCALATIONS)?;
+    let feedback_bytes = serde_json::to_vec(event).context("encode SurpriseEvent")?;
+    let queue_bytes = bincode::serialize(queue).context("encode ActiveLearningQueueState")?;
+    let mut bytes_written = feedback_bytes.len() as u64 + queue_bytes.len() as u64;
+    let mut writes = 2_u64;
+    let mut batch = WriteBatch::default();
+    batch.put_cf(feedback_cf, feedback_key, &feedback_bytes);
+    batch.put_cf(queue_cf, b"active", &queue_bytes);
+    for entry in &queue.evicted {
+        let entry_bytes = bincode::serialize(entry).context("encode active-learning eviction")?;
+        bytes_written = bytes_written.saturating_add(entry_bytes.len() as u64);
+        writes = writes.saturating_add(1);
+        batch.put_cf(evictions_cf, entry.task_id.0.as_bytes(), entry_bytes);
+    }
+    for entry in &queue.ood_escalations {
+        let entry_bytes = bincode::serialize(entry).context("encode OOD escalation")?;
+        bytes_written = bytes_written.saturating_add(entry_bytes.len() as u64);
+        writes = writes.saturating_add(1);
+        batch.put_cf(ood_cf, entry.task_id.0.as_bytes(), entry_bytes);
+    }
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    db.write_opt(batch, &opts).context("atomic RocksDB write")?;
+
+    let feedback_readback = db
+        .get_cf(feedback_cf, feedback_key)?
+        .ok_or_else(|| anyhow!("CF_MEJEPA_AGENT_FEEDBACK readback missing"))?;
+    if feedback_readback != feedback_bytes {
+        bail!("CF_MEJEPA_AGENT_FEEDBACK readback bytes differ");
+    }
+    let decoded_event: SurpriseEvent =
+        serde_json::from_slice(&feedback_readback).context("decode SurpriseEvent readback")?;
+    decoded_event
+        .validate()
+        .map_err(|err| anyhow!("SurpriseEvent readback validation failed: {err}"))?;
+    if decoded_event != *event {
+        bail!("CF_MEJEPA_AGENT_FEEDBACK decoded readback differs");
+    }
+
+    let queue_readback = db
+        .get_cf(queue_cf, b"active")?
+        .ok_or_else(|| anyhow!("CF_MEJEPA_ACTIVE_LEARNING_QUEUE readback missing"))?;
+    if queue_readback != queue_bytes {
+        bail!("CF_MEJEPA_ACTIVE_LEARNING_QUEUE readback bytes differ");
+    }
+    let _decoded_queue: ActiveLearningQueueState =
+        bincode::deserialize(&queue_readback).context("decode queue readback")?;
+    if let Some(counters) = system_cost_counters {
+        counters.record_rocksdb_writes(bytes_written, writes);
+    }
+    Ok(())
+}
+
+fn cf_handle<'a>(db: &'a DB, name: &str) -> AnyhowResult<&'a rocksdb::ColumnFamily> {
+    db.cf_handle(name)
+        .ok_or_else(|| anyhow!("missing RocksDB column family {name}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PausePredictionState {
+    paused_until_unix_ms: i64,
+    set_at_unix_ms: i64,
+    reason: String,
+    source: String,
+}
+
+fn resolve_pause_state_path(input: Option<PathBuf>) -> Result<PathBuf, String> {
+    match input {
+        Some(path) if path.as_os_str().is_empty() => {
+            Err("statePath must be a non-empty path".to_string())
+        }
+        Some(path) => Ok(path),
+        None => match std::env::var(ENV_PAUSE_PATH) {
+            Ok(path) if path.trim().is_empty() => {
+                Err(format!("{ENV_PAUSE_PATH} must be non-empty"))
+            }
+            Ok(path) => Ok(PathBuf::from(path)),
+            Err(std::env::VarError::NotPresent) => Ok(PathBuf::from(DEFAULT_PAUSE_STATE_PATH)),
+            Err(err) => Err(format!("{ENV_PAUSE_PATH} must be readable UTF-8: {err}")),
+        },
+    }
+}
+
+fn write_pause_state(state_path: &Path, duration_mins: u64, reason: &str) -> AnyhowResult<Value> {
+    if state_path.as_os_str().is_empty() {
+        bail!("MEJEPA_PAUSE_STATE_PATH_EMPTY: statePath must be a non-empty path");
+    }
+    if duration_mins == 0 {
+        bail!("MEJEPA_PAUSE_DURATION_ZERO: durationMins must be > 0");
+    }
+    if duration_mins > 7 * 24 * 60 {
+        bail!(
+            "MEJEPA_PAUSE_DURATION_EXCEEDS_WEEK: durationMins must be <= 10080; got {duration_mins}"
+        );
+    }
+    if reason.trim().is_empty() || reason.chars().any(char::is_control) {
+        bail!("MEJEPA_PAUSE_REASON_INVALID: reason must be non-empty and contain no control characters");
+    }
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("MEJEPA_PAUSE_PARENT_CREATE_FAILED: {}", parent.display()))?;
+    }
+    let set_at_unix_ms: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("MEJEPA_PAUSE_CLOCK_BEFORE_UNIX_EPOCH")?
+        .as_millis()
+        .try_into()
+        .context("MEJEPA_PAUSE_CLOCK_OVERFLOW")?;
+    let duration_ms = duration_mins
+        .checked_mul(60_000)
+        .and_then(|value| i64::try_from(value).ok())
+        .context("MEJEPA_PAUSE_DURATION_OVERFLOW")?;
+    let paused_until_unix_ms = set_at_unix_ms
+        .checked_add(duration_ms)
+        .context("MEJEPA_PAUSE_UNTIL_OVERFLOW")?;
+    let state = PausePredictionState {
+        paused_until_unix_ms,
+        set_at_unix_ms,
+        reason: reason.to_string(),
+        source: tool_names::MEJEPA_PAUSE_PREDICTIONS.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state).context("MEJEPA_PAUSE_SERIALIZE_FAILED")?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(state_path)
+        .with_context(|| format!("MEJEPA_PAUSE_WRITE_OPEN_FAILED: {}", state_path.display()))?;
+    std::io::Write::write_all(&mut file, &bytes)
+        .with_context(|| format!("MEJEPA_PAUSE_WRITE_FAILED: {}", state_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("MEJEPA_PAUSE_SYNC_FAILED: {}", state_path.display()))?;
+    drop(file);
+    let readback_bytes = std::fs::read(state_path)
+        .with_context(|| format!("MEJEPA_PAUSE_READBACK_FAILED: {}", state_path.display()))?;
+    if readback_bytes != bytes {
+        bail!("MEJEPA_PAUSE_READBACK_BYTES_MISMATCH");
+    }
+    let readback: PausePredictionState = serde_json::from_slice(&readback_bytes)
+        .context("MEJEPA_PAUSE_READBACK_DESERIALIZE_FAILED")?;
+    if readback != state {
+        bail!("MEJEPA_PAUSE_READBACK_STATE_MISMATCH");
+    }
+    validate_pause_state(&readback)?;
+    Ok(json!({
+        "statePath": state_path,
+        "pausedUntilUnixMs": state.paused_until_unix_ms,
+        "setAtUnixMs": state.set_at_unix_ms,
+        "durationMins": duration_mins,
+        "reason": state.reason,
+        "readbackEqual": true,
+        "sourceOfTruth": {
+            "kind": "file",
+            "path": state_path,
+            "writer": "mcp__cgreality__mejepa_pause_predictions",
+        }
+    }))
+}
+
+fn now_unix_ms() -> AnyhowResult<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("MEJEPA_PAUSE_CLOCK_BEFORE_UNIX_EPOCH")?
+        .as_millis()
+        .try_into()
+        .context("MEJEPA_PAUSE_CLOCK_OVERFLOW")
+}
+
+fn active_pause_state(
+    state_path: &Path,
+    now_unix_ms: i64,
+) -> AnyhowResult<Option<PausePredictionState>> {
+    if state_path.as_os_str().is_empty() {
+        bail!("MEJEPA_PAUSE_STATE_PATH_EMPTY: statePath must be a non-empty path");
+    }
+    if !state_path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(state_path)
+        .with_context(|| format!("MEJEPA_PAUSE_READBACK_FAILED: {}", state_path.display()))?;
+    if bytes.is_empty() {
+        bail!(
+            "MEJEPA_PAUSE_STATE_EMPTY: {} is empty",
+            state_path.display()
+        );
+    }
+    let state: PausePredictionState =
+        serde_json::from_slice(&bytes).context("MEJEPA_PAUSE_READBACK_DESERIALIZE_FAILED")?;
+    validate_pause_state(&state)?;
+    if state.paused_until_unix_ms > now_unix_ms {
+        Ok(Some(state))
+    } else {
+        Ok(None)
+    }
+}
+
+fn validate_pause_state(state: &PausePredictionState) -> AnyhowResult<()> {
+    if state.paused_until_unix_ms <= state.set_at_unix_ms {
+        bail!("MEJEPA_PAUSE_STATE_INVALID: pausedUntilUnixMs must be greater than setAtUnixMs");
+    }
+    if state.reason.trim().is_empty() || state.reason.chars().any(char::is_control) {
+        bail!("MEJEPA_PAUSE_STATE_INVALID: reason must be non-empty and contain no control characters");
+    }
+    if state.source.trim().is_empty() || state.source.chars().any(char::is_control) {
+        bail!("MEJEPA_PAUSE_STATE_INVALID: source must be non-empty and contain no control characters");
+    }
+    Ok(())
+}
+
+fn pause_state_value(state_path: &Path, state: &PausePredictionState, now_unix_ms: i64) -> Value {
+    json!({
+        "statePath": state_path,
+        "pausedUntilUnixMs": state.paused_until_unix_ms,
+        "setAtUnixMs": state.set_at_unix_ms,
+        "remainingMs": state.paused_until_unix_ms.saturating_sub(now_unix_ms),
+        "reason": state.reason.clone(),
+        "source": state.source.clone(),
+        "sourceOfTruth": {
+            "kind": "file",
+            "path": state_path,
+            "reader": "mcp__cgreality__mejepa_verify",
+        }
+    })
+}
+
+fn count_cf_any(db: &DB, name: &str) -> AnyhowResult<u64> {
+    let cf = cf_handle(db, name)?;
+    let mut count = 0u64;
+    for item in db.iterator_cf(cf, IteratorMode::Start) {
+        let _ = item?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn parse_runtime_versions(
+    input: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<EmbedderId, [u8; 32]>, String> {
+    if input.len() != EmbedderId::all().len() {
+        return Err(format!(
+            "runtimeEmbedderVersions must contain exactly {} entries, got {}",
+            EmbedderId::all().len(),
+            input.len()
+        ));
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in input {
+        let embedder = EmbedderId::from_str(key)
+            .map_err(|err| format!("invalid embedder id {key:?}: {err}"))?;
+        let digest = parse_version_id(value)
+            .map_err(|err| format!("invalid digest for {embedder}: {err}"))?;
+        out.insert(embedder, digest);
+    }
+    for embedder in EmbedderId::all() {
+        if !out.contains_key(&embedder) {
+            return Err(format!("runtimeEmbedderVersions missing {embedder}"));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_version_id(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected exactly 64 hexadecimal characters, got {value:?}"
+        ));
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(value, &mut out)
+        .map_err(|err| format!("hex decode failed for {value:?}: {err}"))?;
+    Ok(out)
+}
+
+#[cfg(test)]
+// Tests use a shared sync Mutex (test_env_lock) to serialize env-var setup
+// across `current_thread` tokio tests. The guard is intentionally held across
+// `.await` to keep the env vars stable for the duration of each test; no
+// real concurrency risk because tests run single-threaded and the lock is
+// the only synchronization point.
+#[allow(clippy::await_holding_lock)]
+mod mejepa_constellation_inspect_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::sync::MutexGuard;
+    use std::time::{Duration, SystemTime};
+
+    use context_graph_mejepa_tct::{
+        Centroid, CorpusProvenance, EntityType, Language, MutationCategory, OracleOutcome,
+        ShrinkageOrigin, TctConstellation, Thresholds,
+    };
+    use tempfile::TempDir;
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        // Shared cross-module lock — see crate::handlers::tools::test_env_lock.
+        // mejepa_phase7_storage's FSV tests touch the same env vars.
+        let guard = crate::handlers::tools::test_env_lock::lock();
+        std::env::remove_var(ENV_TCT_DB);
+        std::env::remove_var(ENV_INFER_DB);
+        std::env::remove_var(ENV_PAUSE_PATH);
+        std::env::remove_var(
+            crate::handlers::tools::mejepa_agent_identity::ENV_MEJEPA_AGENTS_CONFIG,
+        );
+        std::env::remove_var(context_graph_mejepa_tct::ENV_ALLOW_STALE);
+        std::env::remove_var(context_graph_mejepa_tct::ENV_MAX_AGE_DAYS);
+        guard
+    }
+
+    #[test]
+    fn pause_predictions_writes_state_file_and_reads_back() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("pause-state.json");
+        let value = write_pause_state(&path, 5, "unit-test").unwrap();
+        assert_eq!(value["readbackEqual"], true);
+        let readback: PausePredictionState =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(readback.paused_until_unix_ms > readback.set_at_unix_ms);
+        assert_eq!(readback.reason, "unit-test");
+        assert_eq!(readback.source, tool_names::MEJEPA_PAUSE_PREDICTIONS);
+    }
+
+    #[test]
+    fn pause_predictions_rejects_invalid_duration() {
+        let tmp = TempDir::new().unwrap();
+        let err =
+            write_pause_state(&tmp.path().join("pause-state.json"), 0, "unit-test").unwrap_err();
+        assert!(err.to_string().contains("MEJEPA_PAUSE_DURATION_ZERO"));
+    }
+
+    #[test]
+    fn check_bedrock_consistency_reads_foundationality_cf() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("infer-rocksdb");
+        let db = open_infer_rocksdb(&db_path).unwrap();
+        let edges = vec![
+            context_graph_mejepa::ChunkDependencyEdge::new(
+                "app.py::handler",
+                "pkg/core.py::Base",
+                "call",
+                1.0,
+                "test",
+            ),
+            context_graph_mejepa::ChunkDependencyEdge::new(
+                "tests/test_core.py::test_base",
+                "pkg/core.py::Base",
+                "test_verifies",
+                1.0,
+                "test",
+            ),
+        ];
+        let report = context_graph_mejepa::compute_chunk_foundationality(
+            &edges,
+            1,
+            context_graph_mejepa::ChunkFoundationalityConfig::default(),
+        )
+        .unwrap();
+        context_graph_mejepa::persist_chunk_foundationality_report_sync_readback(
+            db.as_ref(),
+            &edges,
+            &report,
+        )
+        .unwrap();
+        drop(db);
+
+        let value = run_check_bedrock_consistency(
+            &db_path,
+            CheckBedrockConsistencyRequest {
+                patch:
+                    "diff --git a/pkg/core.py b/pkg/core.py\n--- a/pkg/core.py\n+++ b/pkg/core.py\n"
+                        .to_string(),
+                threshold: 0.75,
+                top_k: 5,
+                db_path: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(value["report"]["bedrockTouched"], true);
+        assert_eq!(
+            value["sourceOfTruth"]["foundationalityCf"],
+            CF_MEJEPA_CHUNK_FOUNDATIONALITY
+        );
+    }
+
+    #[test]
+    fn active_pause_state_only_returns_future_pauses() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("pause-state.json");
+        let future = PausePredictionState {
+            paused_until_unix_ms: 2_000,
+            set_at_unix_ms: 1_000,
+            reason: "unit-test".to_string(),
+            source: tool_names::MEJEPA_PAUSE_PREDICTIONS.to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+        assert!(active_pause_state(&path, 1_500).unwrap().is_some());
+        assert!(active_pause_state(&path, 2_000).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mejepa_pause_predictions_handler_writes_state_file() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let tmp = TempDir::new().unwrap();
+        let state_path = tmp.path().join("pause-state.json");
+        let response = handlers
+            .call_mejepa_pause_predictions(
+                Some(JsonRpcId::Number(47)),
+                json!({
+                    "statePath": state_path.display().to_string(),
+                    "durationMins": 5,
+                    "reason": "incident response"
+                }),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["readbackEqual"], true);
+        assert_eq!(structured["reason"], "incident response");
+        let readback: PausePredictionState =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert!(readback.paused_until_unix_ms > readback.set_at_unix_ms);
+
+        let zero_response = handlers
+            .call_mejepa_pause_predictions(
+                Some(JsonRpcId::Number(48)),
+                json!({
+                    "statePath": state_path.display().to_string(),
+                    "durationMins": 0,
+                    "reason": "x"
+                }),
+            )
+            .await;
+        let zero_result = zero_response.result.unwrap();
+        assert_eq!(zero_result["isError"], true);
+        assert!(zero_result["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MEJEPA_PAUSE_DURATION_ZERO"));
+    }
+
+    #[test]
+    fn mejepa_verify_honors_active_pause_state() {
+        let _guard = env_guard();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (handlers, _handler_tempdir) =
+            runtime.block_on(crate::handlers::tests::create_protocol_test_handlers());
+        let tmp = TempDir::new().unwrap();
+        let infer_db = tmp.path().join("infer-db");
+        let pause_path = tmp.path().join("pause-state.json");
+        std::env::set_var(ENV_INFER_DB, &infer_db);
+        std::env::set_var(ENV_PAUSE_PATH, &pause_path);
+        write_pause_state(&pause_path, 5, "operator requested pause").unwrap();
+        let (patch, context) =
+            context_graph_mejepa::fixture_patch_context(tmp.path(), "happy").unwrap();
+        let response = runtime.block_on(handlers.call_mejepa_verify(
+            Some(JsonRpcId::Number(49)),
+            json!({
+                "patch": patch,
+                "context": context,
+                "includeProvenance": true
+            }),
+        ));
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["verdict"], "escalate_to_human");
+        assert_eq!(structured["failed_gate"]["kind"], "prediction_paused");
+        assert_eq!(structured["gates_passed"], 0);
+        assert_eq!(
+            structured["pause_state"]["reason"],
+            "operator requested pause"
+        );
+        assert!(structured["pause_state"]["remainingMs"].as_i64().unwrap() > 0);
+        assert_eq!(
+            structured["provenance"]["pauseStatePath"],
+            json!(pause_path.display().to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mejepa_operator_override_prediction_persists_override_and_label() {
+        let _guard = env_guard();
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let tmp = TempDir::new().unwrap();
+        let infer_db = tmp.path().join("infer-db");
+        let agents_config = tmp.path().join("agents.toml");
+        let operator_psk = "operator-override-unit-secret";
+        write_single_agent_config(
+            &agents_config,
+            "operator-override-unit-test",
+            operator_psk,
+            true,
+        );
+        std::env::set_var(
+            crate::handlers::tools::mejepa_agent_identity::ENV_MEJEPA_AGENTS_CONFIG,
+            &agents_config,
+        );
+        let prediction = inspect_prediction_fixture([0x60; 16], "src/lib.rs#fn#override");
+        let prediction_id = PredictionId(prediction.prediction_id);
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        persist_prediction_and_dda(db.clone(), &prediction);
+        drop(db);
+        let identity_attestation = signed_identity_json(
+            operator_psk,
+            tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+            "operator-override-unit-test",
+            "operator-override-unit-session",
+            "nonce-operator-override-unit",
+        );
+
+        let response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(60)),
+                json!({
+                    "dbPath": infer_db.display().to_string(),
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "overrideVerdict": "fail",
+                    "reason": "operator readback test",
+                    "operatorId": "operator-override-unit-test",
+                    "identityAttestation": identity_attestation
+                }),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["status"], "recorded");
+        assert_eq!(structured["operatorOverrideCountBefore"], 0);
+        assert_eq!(structured["operatorOverrideCountAfter"], 1);
+        assert_eq!(structured["samplingWeightMultiplier"], 6.0);
+        assert_eq!(
+            structured["sourceOfTruth"]["overrideCf"],
+            json!(CF_MEJEPA_OPERATOR_OVERRIDES)
+        );
+        assert_eq!(
+            structured["sourceOfTruth"]["labelCf"],
+            json!(CF_MEJEPA_ACTIVE_LEARNING_LABELS)
+        );
+        assert_eq!(structured["readback"]["overrideFlagForNextBatch"], true);
+
+        let reopened = open_infer_rocksdb(&infer_db).unwrap();
+        let override_readback = load_operator_override(reopened.as_ref(), prediction_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(override_readback.override_verdict, OverrideVerdict::Fail);
+        assert_eq!(override_readback.reason, "operator readback test");
+        let eval_store = RocksDbEvalStore::new(reopened.clone()).unwrap();
+        let label_readback = eval_store.load_label(&prediction.task_id).unwrap().unwrap();
+        assert_eq!(
+            label_readback.oracle_outcome,
+            context_graph_mejepa::OracleOutcome::Fail
+        );
+        assert_eq!(label_readback.method, LabelMethod::Human);
+        drop(eval_store);
+        drop(reopened);
+
+        let missing_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(61)),
+                json!({
+                    "dbPath": infer_db.display().to_string(),
+                    "predictionId": hex::encode([0x61; 16]),
+                    "overrideVerdict": "fail",
+                    "reason": "operator readback test",
+                    "operatorId": "operator-override-unit-test",
+                    "identityAttestation": signed_identity_json(
+                        operator_psk,
+                        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+                        "operator-override-unit-test",
+                        "operator-override-unit-session",
+                        "nonce-operator-override-missing-prediction"
+                    )
+                }),
+            )
+            .await;
+        let missing_result = missing_response.result.unwrap();
+        assert_eq!(missing_result["isError"], true);
+        let missing_text = missing_result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            missing_text.contains("CF_MEJEPA_LIVE_PREDICTIONS"),
+            "{missing_text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mejepa_agent_identity_attestation_writes_phase_f_fsv_artifact() {
+        let _guard = env_guard();
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let started_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let fsv_root = PathBuf::from("/var/lib/contextgraph/fsv/phase-f-agent-identity-fsv");
+        fs::create_dir_all(&fsv_root).unwrap();
+        let run_root = fsv_root.join(format!(
+            "mcp-run-{}-{}",
+            started_at_unix_ms,
+            std::process::id()
+        ));
+        fs::create_dir_all(&run_root).unwrap();
+        let infer_db = run_root.join("infer-db");
+        let agents_config = run_root.join("agents.toml");
+        let agent_psk = "phase-f-agent-secret-0001";
+        let operator_psk = "phase-f-operator-secret-0001";
+        fs::write(
+            &agents_config,
+            format!(
+                r#"[[agents]]
+agent_id = "agent-codex"
+psk = "{agent_psk}"
+
+[[agents]]
+agent_id = "operator-1"
+psk = "{operator_psk}"
+can_operator_override = true
+"#
+            ),
+        )
+        .unwrap();
+        std::env::set_var(ENV_INFER_DB, &infer_db);
+        std::env::set_var(
+            crate::handlers::tools::mejepa_agent_identity::ENV_MEJEPA_AGENTS_CONFIG,
+            &agents_config,
+        );
+
+        let prediction = inspect_prediction_fixture([0x92; 16], "src/lib.rs#fn#identity");
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let cf_counts_before = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap(),
+            CF_MEJEPA_AGENT_FEEDBACK: count_cf_any(db.as_ref(), CF_MEJEPA_AGENT_FEEDBACK).unwrap(),
+            CF_MEJEPA_OPERATOR_OVERRIDES: count_cf_any(db.as_ref(), CF_MEJEPA_OPERATOR_OVERRIDES).unwrap(),
+            CF_MEJEPA_ACTIVE_LEARNING_LABELS: count_cf_any(db.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_LABELS).unwrap()
+        });
+        persist_prediction_and_dda(db.clone(), &prediction);
+        drop(db);
+
+        let session_id = "phase-f-agent-identity-session";
+        let valid_feedback_sig = signed_identity_json(
+            agent_psk,
+            tool_names::MEJEPA_RECORD_AGENT_FEEDBACK,
+            "agent-codex",
+            session_id,
+            "nonce-valid-feedback",
+        );
+        let valid_feedback_response = handlers
+            .call_mejepa_record_agent_feedback(
+                Some(JsonRpcId::Number(920)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "agentId": "agent-codex",
+                    "feedbackKind": "confirmed",
+                    "agentExplanation": "signed identity FSV feedback",
+                    "severity": "high",
+                    "identityAttestation": valid_feedback_sig
+                }),
+            )
+            .await;
+        let valid_feedback_result = valid_feedback_response.result.unwrap();
+        let valid_feedback = valid_feedback_result["structuredContent"].clone();
+
+        let invalid_feedback_sig = signed_identity_json(
+            "wrong-phase-f-agent-secret",
+            tool_names::MEJEPA_RECORD_AGENT_FEEDBACK,
+            "agent-codex",
+            session_id,
+            "nonce-invalid-feedback",
+        );
+        let invalid_feedback_response = handlers
+            .call_mejepa_record_agent_feedback(
+                Some(JsonRpcId::Number(921)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "agentId": "agent-codex",
+                    "feedbackKind": "surprise",
+                    "agentExplanation": "bad signature should fail",
+                    "severity": "high",
+                    "identityAttestation": invalid_feedback_sig
+                }),
+            )
+            .await;
+        let invalid_feedback_result = invalid_feedback_response.result.unwrap();
+
+        let anonymous_response = handlers
+            .call_mejepa_record_agent_feedback(
+                Some(JsonRpcId::Number(922)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "feedbackKind": "confirmed",
+                    "agentExplanation": "anonymous feedback stays anonymous",
+                    "severity": "low"
+                }),
+            )
+            .await;
+        let anonymous_result = anonymous_response.result.unwrap();
+        let anonymous_feedback = anonymous_result["structuredContent"].clone();
+
+        let operator_sig = signed_identity_json(
+            operator_psk,
+            tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+            "operator-1",
+            session_id,
+            "nonce-valid-operator",
+        );
+        let operator_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(923)),
+                json!({
+                    "dbPath": infer_db.display().to_string(),
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "overrideVerdict": "fail",
+                    "reason": "signed operator identity FSV",
+                    "operatorId": "operator-1",
+                    "identityAttestation": operator_sig
+                }),
+            )
+            .await;
+        let operator_result = operator_response.result.unwrap();
+        let operator_override = operator_result["structuredContent"].clone();
+
+        let missing_operator_sig_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(924)),
+                json!({
+                    "dbPath": infer_db.display().to_string(),
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "overrideVerdict": "fail",
+                    "reason": "unsigned operator should fail",
+                    "operatorId": "operator-1"
+                }),
+            )
+            .await;
+        let missing_operator_sig_result = missing_operator_sig_response.result.unwrap();
+
+        let reopened = open_infer_rocksdb(&infer_db).unwrap();
+        let feedback_agents = read_feedback_agent_ids(reopened.as_ref());
+        let override_readback =
+            load_operator_override(reopened.as_ref(), PredictionId(prediction.prediction_id))
+                .unwrap()
+                .unwrap();
+        let eval_store = RocksDbEvalStore::new(reopened.clone()).unwrap();
+        let label_readback = eval_store.load_label(&prediction.task_id).unwrap().unwrap();
+        let cf_counts_after = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(reopened.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap(),
+            CF_MEJEPA_AGENT_FEEDBACK: count_cf_any(reopened.as_ref(), CF_MEJEPA_AGENT_FEEDBACK).unwrap(),
+            CF_MEJEPA_OPERATOR_OVERRIDES: count_cf_any(reopened.as_ref(), CF_MEJEPA_OPERATOR_OVERRIDES).unwrap(),
+            CF_MEJEPA_ACTIVE_LEARNING_LABELS: count_cf_any(reopened.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_LABELS).unwrap()
+        });
+        let independent_reopen_equal = feedback_agents == vec!["agent-codex", "anonymous"]
+            && override_readback.operator_id == "operator-1"
+            && override_readback.reason == "signed operator identity FSV"
+            && label_readback.method == LabelMethod::Human
+            && label_readback.oracle_outcome == context_graph_mejepa::OracleOutcome::Fail;
+        drop(eval_store);
+        drop(reopened);
+
+        let happy_path = vec![
+            json!({
+                "case": "signed_agent_feedback_accepts_configured_identity",
+                "sot": format!("{CF_MEJEPA_AGENT_FEEDBACK} + {}", agents_config.display()),
+                "before": {"agent_id": "agent-codex"},
+                "trigger": "cargo test -p context-graph-mcp mejepa_agent_identity_attestation_writes_phase_f_fsv_artifact -- --nocapture",
+                "after": valid_feedback,
+                "expected": {"identity.authenticated": true, "agentId": "agent-codex"},
+                "actual": valid_feedback_result["isError"] == false,
+                "pass": valid_feedback_result["isError"] == false
+                    && valid_feedback["agentId"] == json!("agent-codex")
+                    && valid_feedback["identity"]["authenticated"] == json!(true),
+                "evidence_path": run_root.display().to_string()
+            }),
+            json!({
+                "case": "signed_operator_override_accepts_configured_operator",
+                "sot": format!("{CF_MEJEPA_OPERATOR_OVERRIDES} + {CF_MEJEPA_ACTIVE_LEARNING_LABELS}"),
+                "before": {"operator_id": "operator-1"},
+                "trigger": "cargo test -p context-graph-mcp mejepa_agent_identity_attestation_writes_phase_f_fsv_artifact -- --nocapture",
+                "after": operator_override,
+                "expected": {"identity.authenticated": true, "operatorId": "operator-1"},
+                "actual": operator_result["isError"] == false,
+                "pass": operator_result["isError"] == false
+                    && operator_override["operatorId"] == json!("operator-1")
+                    && operator_override["identity"]["authenticated"] == json!(true),
+                "evidence_path": run_root.display().to_string()
+            }),
+        ];
+        let boundary_cases = vec![
+            json!({
+                "case": "invalid_psk_rejected",
+                "expected": "MEJEPA_AGENT_IDENTITY_UNVERIFIED",
+                "actual": invalid_feedback_result,
+                "pass": invalid_feedback_result["isError"] == true
+                    && invalid_feedback_result["structuredContent"]["error_code"]
+                        == json!(crate::handlers::tools::mejepa_agent_identity::MEJEPA_AGENT_IDENTITY_UNVERIFIED)
+            }),
+            json!({
+                "case": "anonymous_feedback_writes_anonymous_agent_id",
+                "expected": "agent_id = anonymous",
+                "actual": anonymous_feedback,
+                "pass": anonymous_result["isError"] == false
+                    && anonymous_feedback["agentId"] == json!("anonymous")
+                    && anonymous_feedback["identity"]["authenticated"] == json!(false)
+            }),
+            json!({
+                "case": "unsigned_operator_override_rejected",
+                "expected": "MEJEPA_AGENT_IDENTITY_UNVERIFIED",
+                "actual": missing_operator_sig_result,
+                "pass": missing_operator_sig_result["isError"] == true
+                    && missing_operator_sig_result["structuredContent"]["error_code"]
+                        == json!(crate::handlers::tools::mejepa_agent_identity::MEJEPA_AGENT_IDENTITY_UNVERIFIED)
+            }),
+        ];
+        let all_happy_pass = happy_path
+            .iter()
+            .all(|case| case["pass"].as_bool() == Some(true));
+        let all_boundaries_pass = boundary_cases
+            .iter()
+            .all(|case| case["pass"].as_bool() == Some(true));
+        let report = json!({
+            "fsv_root": fsv_root,
+            "task_id": "TASK-SEC-009",
+            "issue": 92,
+            "started_at_unix_ms": started_at_unix_ms,
+            "build_release_sha": std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|text| text.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            "happy_path": happy_path,
+            "boundary_cases": boundary_cases,
+            "all_passed": all_happy_pass && all_boundaries_pass && independent_reopen_equal,
+            "cf_counts_before": cf_counts_before,
+            "cf_counts_after": cf_counts_after,
+            "readback_equal": independent_reopen_equal,
+            "source_of_truth": {
+                "agents_config": agents_config.display().to_string(),
+                "feedback_cf": CF_MEJEPA_AGENT_FEEDBACK,
+                "operator_override_cf": CF_MEJEPA_OPERATOR_OVERRIDES,
+                "active_learning_label_cf": CF_MEJEPA_ACTIVE_LEARNING_LABELS,
+                "feedback_agents_after_reopen": feedback_agents,
+                "operator_id_after_reopen": override_readback.operator_id
+            },
+            "physical_artifacts": {
+                "infer_db_exists": infer_db.exists(),
+                "agents_config_exists": agents_config.exists(),
+                "run_root": run_root.display().to_string(),
+                "infer_db": physical_file_summary(&infer_db)
+            }
+        });
+        assert_eq!(
+            report["all_passed"],
+            true,
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap()
+        );
+        let evidence_path = fsv_root.join("agent_identity_mcp_fsv.json");
+        write_fsv_json(&evidence_path, &report);
+        let readback: Value = serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(readback["all_passed"], true);
+        assert_eq!(readback["readback_equal"], true);
+    }
+
+    fn signed_identity_json(
+        psk: &str,
+        tool_name: &str,
+        claimed_id: &str,
+        session_id: &str,
+        nonce: &str,
+    ) -> Value {
+        let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
+        let signature_hex =
+            crate::handlers::tools::mejepa_agent_identity::sign_identity_attestation(
+                psk,
+                tool_name,
+                claimed_id,
+                session_id,
+                nonce,
+                timestamp_unix_ms,
+            )
+            .unwrap();
+        json!({
+            "sessionId": session_id,
+            "nonce": nonce,
+            "timestampUnixMs": timestamp_unix_ms,
+            "signatureHex": signature_hex
+        })
+    }
+
+    fn write_single_agent_config(path: &Path, agent_id: &str, psk: &str, operator: bool) {
+        fs::write(
+            path,
+            format!(
+                r#"[[agents]]
+agent_id = "{agent_id}"
+psk = "{psk}"
+can_operator_override = {operator}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn read_feedback_agent_ids(db: &DB) -> Vec<String> {
+        let cf = cf_handle(db, CF_MEJEPA_AGENT_FEEDBACK).unwrap();
+        let mut ids = db
+            .iterator_cf(cf, IteratorMode::Start)
+            .map(|row| {
+                let (_key, value) = row.unwrap();
+                let event: SurpriseEvent = serde_json::from_slice(&value).unwrap();
+                event.agent_id.0
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn versions(seed: u8) -> BTreeMap<EmbedderId, [u8; 32]> {
+        EmbedderId::all()
+            .into_iter()
+            .enumerate()
+            .map(|(idx, embedder)| (embedder, [seed.wrapping_add(idx as u8); 32]))
+            .collect()
+    }
+
+    fn centroid(sample_count: usize) -> Centroid {
+        Centroid::try_new(
+            vec![1.0],
+            sample_count,
+            ShrinkageOrigin::OwnCell,
+            "mcp-test",
+        )
+        .unwrap()
+    }
+
+    fn by_embedder(sample_count: usize) -> BTreeMap<EmbedderId, Centroid> {
+        EmbedderId::all()
+            .into_iter()
+            .map(|embedder| (embedder, centroid(sample_count)))
+            .collect()
+    }
+
+    fn thresholds() -> Thresholds {
+        let panel_level = EmbedderId::all()
+            .into_iter()
+            .map(|embedder| (embedder, 0.8))
+            .collect();
+        let per_chunk_type = EmbedderId::all()
+            .into_iter()
+            .map(|embedder| ((EntityType::Function, embedder), 0.9))
+            .collect();
+        Thresholds::try_new(panel_level, per_chunk_type).unwrap()
+    }
+
+    fn constellation(frozen_at: SystemTime, seed: u8) -> TctConstellation {
+        let embedder_versions = versions(seed);
+        let provenance =
+            CorpusProvenance::try_new([seed; 32], embedder_versions, frozen_at, "a".repeat(40))
+                .unwrap();
+        let mut per_category = BTreeMap::new();
+        per_category.insert(MutationCategory::KnownGood, by_embedder(50));
+        let mut per_language = BTreeMap::new();
+        per_language.insert(
+            (Language::Python, MutationCategory::KnownGood),
+            by_embedder(50),
+        );
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(OracleOutcome::Pass, by_embedder(50));
+        let per_chunk = EmbedderId::all()
+            .into_iter()
+            .map(|embedder| {
+                (
+                    (
+                        MutationCategory::KnownGood,
+                        EntityType::Function,
+                        Language::Python,
+                        embedder,
+                    ),
+                    centroid(50),
+                )
+            })
+            .collect();
+        TctConstellation::try_new(
+            per_category,
+            per_language,
+            outcomes,
+            per_chunk,
+            thresholds(),
+            provenance,
+            frozen_at,
+        )
+        .unwrap()
+    }
+
+    fn persist(temp: &TempDir, constellation: &TctConstellation) {
+        let db = open_tct_rocksdb(temp.path()).unwrap();
+        let store = ConstellationStore::new(db).unwrap();
+        store.persist(constellation).unwrap();
+    }
+
+    fn inspect_prediction_fixture(prediction_id: [u8; 16], chunk: &str) -> RealityPrediction {
+        RealityPrediction::try_new(RealityPrediction {
+            prediction_id,
+            witness_hash: WitnessHash([0x77; 32]),
+            task_id: context_graph_mejepa::TaskId("inspect-test-task".to_string()),
+            session_id: [0x19; 16],
+            language: context_graph_mejepa::Language::Python,
+            covered_chunks: vec![ChunkId(chunk.to_string())],
+            verdict: context_graph_mejepa::Verdict::GuardRejected,
+            confidence_interval: context_graph_mejepa::ConformalInterval {
+                lower: 0.41,
+                upper: 0.74,
+                method: context_graph_mejepa::ConformalMethod::SplitConformal,
+                coverage_target: 0.90,
+                empirical_coverage: 0.89,
+            },
+            predicted_oracle_pass: 0.62,
+            predicted_test_pass: vec![0.61, 0.83],
+            predicted_runtime_trace: [0.0; 32],
+            ood_score: 0.22,
+            outcome_set: context_graph_mejepa::ConformalSet::try_new(
+                vec![context_graph_mejepa::OracleOutcome::Pass],
+                0.1,
+                0.14,
+            )
+            .unwrap(),
+            calibrated_confidence: 0.58,
+            degraded_status: false,
+            granger_attestations: BTreeMap::from([("dda:mean_cosine".to_string(), 0.81)]),
+            predicted_failure_modes: Vec::new(),
+            predicted_failed_tests: Vec::new(),
+            predicted_works: Vec::new(),
+            predicted_uncovered_paths: Vec::new(),
+            predicted_flaky_tests: Vec::new(),
+            guard_violations: vec![context_graph_mejepa::GuardViolation {
+                embedder: context_graph_mejepa::EmbedderId("E7".to_string()),
+                chunk: ChunkId(chunk.to_string()),
+                centroid_id: "known_good:function:python:e7".to_string(),
+                cosine: 0.71,
+                threshold_tau_m: 0.85,
+                deficit: 0.14,
+            }],
+            per_slot_ood_reasons: vec![context_graph_mejepa::PerSlotOodReason {
+                embedder: context_graph_mejepa::EmbedderId("E7".to_string()),
+                chunk: Some(ChunkId(chunk.to_string())),
+                reason: context_graph_mejepa::PerSlotOodReasonKind::GtauViolation,
+                observed_score: 0.71,
+                threshold: 0.85,
+                margin: 0.14,
+                calibration_version: "inspect-test-calibration-v1".to_string(),
+                evidence: "Gtau slot violation: embedder=E7 chunk=inspect fixture".to_string(),
+            }],
+            closest_exemplars: Vec::new(),
+            predicted_edge_cases: Vec::new(),
+            predicted_latent_bugs: Vec::new(),
+            predicted_tech_debt_added: Vec::new(),
+            predicted_dead_code: Vec::new(),
+            predicted_redundant_code: Vec::new(),
+            predicted_perf_regressions: Vec::new(),
+            predicted_security_concerns: Vec::new(),
+            predicted_accuracy_degradations: Vec::new(),
+            predicted_cost_regressions: Vec::new(),
+            predicted_reasoning_class: context_graph_mejepa::ReasoningClass::MostlyCorrect,
+            agent_claim_graph: context_graph_mejepa::AgentClaimGraph::default(),
+            claim_reconciliation: Vec::new(),
+            reality_impact: None,
+            provenance: context_graph_mejepa::PredictionProvenance {
+                predictor_version: "inspect-test-predictor-v1".to_string(),
+                constellation_version: "inspect-test-constellation-v1".to_string(),
+                calibration_version: "inspect-test-calibration-v1".to_string(),
+                active_pointer: hex::encode(prediction_id),
+                train_health_source: String::new(),
+            },
+            source_panel_sha: [0x42; 32],
+            calibration_version: "inspect-test-calibration-v1".to_string(),
+            created_at_unix_ms: 1_778_644_000_000,
+            matched_fingerprint: None,
+            unknown_candidate_id: None,
+            constellation_intelligence: None,
+            slot_attributions: Vec::new(),
+            label_context: Default::default(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn diagnostic_consequence_projection_explains_bad_prediction_with_evidence() {
+        let chunk = "src/lib.rs#fn#diagnostic";
+        let mut prediction = inspect_prediction_fixture([0x73; 16], chunk);
+        prediction.label_context.accepted_label_ids =
+            vec!["slot:e2:temporal_region:near_patch".to_string()];
+        prediction.label_context.active_skill_ids =
+            vec!["skill:wrong_file_test_oracle_import_chain".to_string()];
+        prediction.label_context.active_higher_ability_ids =
+            vec!["ability:claim_to_oracle_failure_chain".to_string()];
+        prediction.label_context.source_membership_keys =
+            vec!["membership:state-1:chunk-1".to_string()];
+        prediction.slot_attributions = vec![SlotAttributionEvidence {
+            schema_version: context_graph_mejepa::SLOT_ATTRIBUTION_SCHEMA_VERSION,
+            slot_id: "e7".to_string(),
+            embedder: Some(context_graph_mejepa::EmbedderId("E7".to_string())),
+            chunk: Some(ChunkId(chunk.to_string())),
+            polarity: SlotAttributionPolarity::Violating,
+            source: SlotAttributionSource::GuardViolation,
+            score: 0.91,
+            threshold: Some(0.85),
+            margin: Some(0.14),
+            reason: "guard violation explains bad consequence".to_string(),
+            relationship_slot_id: None,
+            related_fingerprint_id: None,
+            active_learning_candidate_id: None,
+            q_head: Some("q2_verdict".to_string()),
+            impact_kind: None,
+            evidence: "E7 crossed the calibrated tau for this chunk".to_string(),
+        }];
+
+        let projection = diagnostic_consequence_projection(&prediction, 64);
+        let items = projection["items"].as_array().expect("items array");
+        assert!(!items.is_empty());
+        let verdict = items
+            .iter()
+            .find(|item| item["kind"] == "q2_verdict")
+            .expect("q2 verdict consequence");
+        assert!(verdict["consequenceId"]
+            .as_str()
+            .unwrap()
+            .starts_with("consequence:"));
+        assert!(verdict["whyBad"]
+            .as_str()
+            .unwrap()
+            .contains("guard violation"));
+        assert_eq!(verdict["evidenceStatus"], "direct_evidence");
+        assert_eq!(verdict["directEvidence"]["chunkIds"][0], chunk);
+        assert_eq!(
+            verdict["predictionContext"]["labelContext"]["activeSkillIds"][0],
+            "skill:wrong_file_test_oracle_import_chain"
+        );
+        assert_eq!(
+            verdict["directEvidence"]["slotAttributions"][0]["source"],
+            "guard_violation"
+        );
+    }
+
+    #[test]
+    fn diagnostic_consequence_projection_marks_missing_direct_evidence() {
+        let mut prediction = inspect_prediction_fixture([0x74; 16], "src/lib.rs#fn#covered_only");
+        prediction.guard_violations.clear();
+        prediction.per_slot_ood_reasons.clear();
+        prediction.predicted_failure_modes.clear();
+        prediction.predicted_failed_tests.clear();
+        prediction.verdict = Verdict::Fail;
+
+        let projection = diagnostic_consequence_projection(&prediction, 64);
+        let items = projection["items"].as_array().expect("items array");
+        let verdict = items
+            .iter()
+            .find(|item| item["kind"] == "q2_verdict")
+            .expect("q2 verdict consequence");
+        assert_eq!(verdict["evidenceStatus"], "insufficient_direct_evidence");
+        assert!(verdict["directEvidence"]["chunkIds"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(verdict["whyBad"]
+            .as_str()
+            .unwrap()
+            .contains("no direct chunk/test/guard consequence evidence"));
+    }
+
+    #[test]
+    fn diagnostic_consequence_projection_includes_pass_with_risk() {
+        let chunk = "src/lib.rs#fn#edge_risk";
+        let mut prediction = inspect_prediction_fixture([0x77; 16], chunk);
+        prediction.verdict = Verdict::Pass;
+        prediction.guard_violations.clear();
+        prediction.per_slot_ood_reasons.clear();
+        prediction.predicted_edge_cases = vec![context_graph_mejepa::PredictedEdgeCase {
+            edge_class: context_graph_mejepa::EdgeCaseClass::BoundaryValue,
+            chunk: ChunkId(chunk.to_string()),
+            line_range: (11, 14),
+            triggering_input_description: "empty collection reaches uncovered branch".to_string(),
+            covered_by_test: false,
+            confidence: 0.88,
+        }];
+
+        let projection = diagnostic_consequence_projection(&prediction, 64);
+        let items = projection["items"].as_array().expect("items array");
+        let risk = items
+            .iter()
+            .find(|item| item["kind"] == "q4_pass_with_edge_risk")
+            .expect("pass-with-risk consequence");
+        assert_eq!(risk["evidenceStatus"], "direct_risk_evidence");
+        assert_eq!(risk["directEvidence"]["chunkIds"][0], chunk);
+        assert!(risk["whyBad"].as_str().unwrap().contains("edge-case risk"));
+    }
+
+    #[test]
+    fn consequence_trace_enriches_direct_chunks_with_source_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let infer_db = tmp.path().join("infer-db");
+        let source_jsonl = tmp.path().join("chunk-source.jsonl");
+        let chunk = "src/lib.rs#fn#source";
+        let source_text = "def consequence_source(value):\n    return value + 1\n";
+        fs::write(
+            &source_jsonl,
+            format!(
+                "{{\"chunk_id\":\"{chunk}\",\"relative_path\":\"src/lib.rs\",\"byte_span\":[0,{}],\"source_text\":{}}}\n",
+                source_text.len(),
+                serde_json::to_string(source_text).unwrap()
+            ),
+        )
+        .unwrap();
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let prediction = inspect_prediction_fixture([0x78; 16], chunk);
+        persist_prediction_and_dda(db.clone(), &prediction);
+        drop(db);
+
+        let trace = run_consequence_trace(
+            &infer_db,
+            ConsequenceTraceRequest {
+                prediction_id: hex::encode(prediction.prediction_id),
+                consequence_id: None,
+                db_path: None,
+                chunk_source_jsonl: Some(source_jsonl.clone()),
+                require_source_bytes: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            trace["items"][0]["directEvidence"]["sourceStatus"],
+            "source_bytes_verified"
+        );
+        assert_eq!(
+            trace["items"][0]["directEvidence"]["sourceRows"][0]["sourceText"],
+            source_text
+        );
+        assert_eq!(
+            trace["sourceOfTruth"]["chunkSourceJsonl"],
+            source_jsonl.display().to_string()
+        );
+
+        let missing = run_consequence_trace(
+            &infer_db,
+            ConsequenceTraceRequest {
+                prediction_id: hex::encode(prediction.prediction_id),
+                consequence_id: None,
+                db_path: None,
+                chunk_source_jsonl: None,
+                require_source_bytes: true,
+            },
+        )
+        .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("requireSourceBytes=true requires chunkSourceJsonl"));
+    }
+
+    #[test]
+    fn consequence_trace_filters_by_stable_consequence_id() {
+        let tmp = TempDir::new().unwrap();
+        let infer_db = tmp.path().join("infer-db");
+        let chunk = "src/lib.rs#fn#trace";
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let prediction = inspect_prediction_fixture([0x75; 16], chunk);
+        persist_prediction_and_dda(db.clone(), &prediction);
+        let label_ids = vec!["slot:e2:temporal_region:near_patch".to_string()];
+        let skill_ids = vec!["skill:wrong_file_test_oracle_import_chain".to_string()];
+        let ability_ids = vec!["ability:claim_to_oracle_failure_chain".to_string()];
+        let membership_keys = vec!["membership:state-1:chunk-1".to_string()];
+        let label_signature =
+            context_graph_mejepa_train::label_bridge::accepted_label_signature_hash(&label_ids)
+                .unwrap();
+        let skill_signature = Some(
+            context_graph_mejepa_train::label_bridge::skill_signature_hash(&skill_ids).unwrap(),
+        );
+        let ability_signature = Some(
+            context_graph_mejepa_train::label_bridge::ability_signature_hash(&ability_ids).unwrap(),
+        );
+        let membership_signature = Some(
+            context_graph_mejepa_train::label_bridge::membership_signature_hash(&membership_keys)
+                .unwrap(),
+        );
+        let prediction_id = PredictionId(prediction.prediction_id);
+        let mistake_id = context_graph_mejepa_train::mistake_id_from_evidence_parts(
+            prediction_id,
+            "code_state:trace_test",
+            &label_signature,
+            skill_signature.as_deref(),
+            ability_signature.as_deref(),
+            membership_signature.as_deref(),
+            Verdict::Pass,
+        )
+        .unwrap();
+        let mistake_row = context_graph_mejepa_train::MistakeLogRow {
+            schema_version: 1,
+            mistake_id: mistake_id.clone(),
+            prediction_id,
+            predicted_verdict: prediction.verdict,
+            ground_truth_verdict: Verdict::Pass,
+            truth_source: context_graph_mejepa_train::MistakeTruthSource::SwebenchDockerOracle,
+            code_state_key: "code_state:trace_test".to_string(),
+            named_failure_mode: Some("failure:guard_violation".to_string()),
+            accepted_label_ids: label_ids.clone(),
+            active_skill_ids: skill_ids.clone(),
+            label_signature_hash: label_signature,
+            skill_signature_hash: skill_signature,
+            failure_evidence_set_ids: vec!["failure_evidence:set1".to_string()],
+            replay_row_key: hex::encode(prediction.prediction_id),
+            accepted_registry_sha256: None,
+            usefulness_metrics_sha256: None,
+            learning_bridge_manifest_sha256: None,
+            created_at_unix_ms: prediction.created_at_unix_ms + 1,
+            active_higher_ability_ids: ability_ids.clone(),
+            source_membership_keys: membership_keys.clone(),
+            ability_signature_hash: ability_signature,
+            membership_signature_hash: membership_signature,
+        };
+        context_graph_mejepa_train::write_mistake_log_row_sync_readback(db.as_ref(), &mistake_row)
+            .unwrap();
+        let lifecycle_row = context_graph_mejepa_train::SkillLifecycleAuditRow {
+            schema_version: context_graph_mejepa_train::SKILL_SEQUENCE_SCHEMA_VERSION,
+            skill_audit_id: "skill_audit:trace_test".to_string(),
+            prediction_id: Some(hex::encode(prediction.prediction_id)),
+            mistake_id: Some(mistake_id.clone()),
+            previous_skill_id: Some(skill_ids[0].clone()),
+            decision: context_graph_mejepa_train::SkillLifecycleDecision::UpdateExistingSkill,
+            candidate_skill_id: None,
+            evidence_label_ids: label_ids,
+            evidence_chunk_ids: vec![chunk.to_string()],
+            reason: "consequence trace links refuted prediction to skill lifecycle".to_string(),
+            created_at_unix_ms: prediction.created_at_unix_ms + 2,
+            evidence_skill_ids: skill_ids,
+            evidence_higher_ability_ids: ability_ids,
+            source_membership_keys: membership_keys,
+        };
+        context_graph_mejepa_train::write_skill_lifecycle_audit_row_sync_readback(
+            db.as_ref(),
+            &lifecycle_row,
+        )
+        .unwrap();
+        drop(db);
+
+        let projection = diagnostic_consequence_projection(&prediction, 64);
+        let consequence_id = projection["items"][0]["consequenceId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second_projection = diagnostic_consequence_projection(&prediction, 64);
+        assert_eq!(
+            consequence_id,
+            second_projection["items"][0]["consequenceId"]
+                .as_str()
+                .unwrap()
+        );
+
+        let trace = run_consequence_trace(
+            &infer_db,
+            ConsequenceTraceRequest {
+                prediction_id: hex::encode(prediction.prediction_id),
+                consequence_id: Some(consequence_id.clone()),
+                db_path: None,
+                chunk_source_jsonl: None,
+                require_source_bytes: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(trace["filtered"], true);
+        assert_eq!(trace["consequenceCount"], 1);
+        assert_eq!(trace["items"][0]["consequenceId"], consequence_id);
+        assert_eq!(
+            trace["sourceOfTruth"]["cf"],
+            json!(CF_MEJEPA_LIVE_PREDICTIONS)
+        );
+        assert_eq!(trace["sourceOfTruth"]["readbackVerified"], true);
+        assert_eq!(
+            trace["items"][0]["mistakeLinkage"]["status"],
+            "refuted_or_observed_mistake_rows_found"
+        );
+        assert_eq!(
+            trace["items"][0]["mistakeLinkage"]["mistakeIds"][0],
+            mistake_id
+        );
+        assert_eq!(
+            trace["items"][0]["mistakeLinkage"]["rows"][0]["lifecycleAudits"][0]["decision"],
+            "update_existing_skill"
+        );
+    }
+
+    #[test]
+    fn evidence_to_consequences_reverse_lookup_scans_live_predictions() {
+        let tmp = TempDir::new().unwrap();
+        let infer_db = tmp.path().join("infer-db");
+        let chunk = "src/lib.rs#fn#reverse";
+        let mut prediction = inspect_prediction_fixture([0x76; 16], chunk);
+        prediction.label_context.active_skill_ids =
+            vec!["skill:wrong_file_test_oracle_import_chain".to_string()];
+        prediction.label_context.active_higher_ability_ids =
+            vec!["ability:claim_to_oracle_failure_chain".to_string()];
+        prediction.provenance.constellation_version = "constellation:test-v1".to_string();
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        persist_prediction_and_dda(db.clone(), &prediction);
+        drop(db);
+
+        let chunk_lookup = run_evidence_to_consequences(
+            &infer_db,
+            EvidenceToConsequencesRequest {
+                chunk_id: Some(chunk.to_string()),
+                skill_id: None,
+                constellation_id: None,
+                limit: 16,
+                db_path: None,
+                chunk_source_jsonl: None,
+                require_source_bytes: false,
+            },
+        )
+        .unwrap();
+        assert!(chunk_lookup["matchCount"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            chunk_lookup["matches"][0]["matchScope"],
+            "direct_evidence.chunk_ids"
+        );
+
+        let skill_lookup = run_evidence_to_consequences(
+            &infer_db,
+            EvidenceToConsequencesRequest {
+                chunk_id: None,
+                skill_id: Some("skill:wrong_file_test_oracle_import_chain".to_string()),
+                constellation_id: None,
+                limit: 16,
+                db_path: None,
+                chunk_source_jsonl: None,
+                require_source_bytes: false,
+            },
+        )
+        .unwrap();
+        assert!(skill_lookup["matchCount"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            skill_lookup["matches"][0]["matchScope"],
+            "prediction_context.active_skill_ids"
+        );
+
+        let constellation_lookup = run_evidence_to_consequences(
+            &infer_db,
+            EvidenceToConsequencesRequest {
+                chunk_id: None,
+                skill_id: None,
+                constellation_id: Some("constellation:test-v1".to_string()),
+                limit: 16,
+                db_path: None,
+                chunk_source_jsonl: None,
+                require_source_bytes: false,
+            },
+        )
+        .unwrap();
+        assert!(constellation_lookup["matchCount"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            constellation_lookup["matches"][0]["matchScope"],
+            "prediction_context.constellation.version"
+        );
+
+        let invalid = run_evidence_to_consequences(
+            &infer_db,
+            EvidenceToConsequencesRequest {
+                chunk_id: Some(chunk.to_string()),
+                skill_id: Some("skill:wrong_file_test_oracle_import_chain".to_string()),
+                constellation_id: None,
+                limit: 16,
+                db_path: None,
+                chunk_source_jsonl: None,
+                require_source_bytes: false,
+            },
+        )
+        .unwrap_err();
+        assert!(invalid
+            .to_string()
+            .contains("exactly one of chunkId, skillId, or constellationId"));
+    }
+
+    fn persist_prediction_and_dda(db: Arc<DB>, prediction: &RealityPrediction) {
+        let store = RocksDbInferStore::new(db.clone());
+        context_graph_mejepa::MejepaStore::write_live_prediction(&store, prediction).unwrap();
+        persist_dda_for_prediction(db.as_ref(), prediction);
+    }
+
+    fn persist_dda_for_prediction(db: &DB, prediction: &RealityPrediction) {
+        let cf = cf_handle(db, CF_MEJEPA_DDA_SIGNALS).unwrap();
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        for chunk in &prediction.covered_chunks {
+            let key = bincode::serialize(&(PanelId(prediction.source_panel_sha), chunk)).unwrap();
+            let signals = DdaSignals::try_new(DdaSignals {
+                per_embedder_cosine: vec![0.91, 0.82, 0.73],
+                pairwise_cosine_upper: vec![0.71, 0.62, 0.53],
+                pairwise_mi_upper: vec![0.11, 0.07, 0.03],
+                blind_spot_z_scores: vec![1.2, -0.4, 0.2],
+            })
+            .unwrap();
+            let bytes = serde_json::to_vec(&signals).unwrap();
+            db.put_cf_opt(cf, &key, bytes, &opts).unwrap();
+            let readback = db.get_cf(cf, &key).unwrap().unwrap();
+            let decoded: DdaSignals = serde_json::from_slice(&readback).unwrap();
+            assert_eq!(decoded, signals);
+        }
+        db.flush_cf(cf).unwrap();
+    }
+
+    #[test]
+    fn inspect_prediction_marks_pass_without_ood_calibrator_untrusted() {
+        let tmp = TempDir::new().unwrap();
+        let infer_db = tmp.path().join("infer-db");
+        let chunk = "src/lib.rs#fn#untrusted-pass";
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let mut prediction = inspect_prediction_fixture([0x7a; 16], chunk);
+        prediction.verdict = Verdict::Pass;
+        prediction.guard_violations.clear();
+        prediction.per_slot_ood_reasons.clear();
+        prediction.ood_score = 0.22;
+        persist_prediction_and_dda(db.clone(), &prediction);
+        let before_ood_rows =
+            context_graph_mejepa::count_prediction_ood_calibration_rows(db.as_ref()).unwrap();
+        println!(
+            "FSV before: live_prediction_rows=1 {CF_MEJEPA_OOD_CALIBRATIONS}={before_ood_rows} verdict=Pass ood_score={}",
+            prediction.ood_score
+        );
+        drop(db);
+
+        let inspected = run_inspect_prediction(
+            &infer_db,
+            InspectPredictionRequest {
+                prediction_id: hex::encode(prediction.prediction_id),
+                db_path: None,
+            },
+        )
+        .unwrap();
+        println!(
+            "FSV after: trust_status={} quarantine_required={} ood_calibration_rows={}",
+            inspected["predictionTrust"]["status"],
+            inspected["predictionTrust"]["quarantineRequired"],
+            inspected["sourceOfTruth"]["oodCalibrationRows"]
+        );
+
+        assert_eq!(inspected["predictionTrust"]["status"], "untrusted");
+        assert_eq!(
+            inspected["predictionTrust"]["reasonCode"],
+            context_graph_mejepa::TRUST_REASON_PASS_WITHOUT_OOD_CALIBRATOR
+        );
+        assert_eq!(inspected["predictionTrust"]["quarantineRequired"], true);
+        assert_eq!(inspected["sourceOfTruth"]["oodCalibrationRows"], 0);
+        assert_eq!(
+            inspected["sourceOfTruth"]["oodCalibrationCf"],
+            CF_MEJEPA_OOD_CALIBRATIONS
+        );
+    }
+
+    fn write_fsv_json(path: &Path, value: &Value) {
+        let bytes = serde_json::to_vec_pretty(value).unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mejepa_predict_latest_reads_live_prediction_for_injection_fsv() {
+        let _guard = env_guard();
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let started_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let fsv_root =
+            PathBuf::from("/var/lib/contextgraph/fsv/task-py-g-055-prediction-injection-fsv");
+        fs::create_dir_all(&fsv_root).unwrap();
+        let run_root = fsv_root.join(format!(
+            "mcp-readback-run-{}-{}",
+            started_at_unix_ms,
+            std::process::id()
+        ));
+        fs::create_dir_all(&run_root).unwrap();
+        let artifact_path = run_root.join("mcp_predict_latest_fsv.json");
+        let infer_db = run_root.join("infer-db");
+
+        let mut prediction = inspect_prediction_fixture([0x55; 16], "src/live.py#fn#prediction");
+        prediction.session_id = [0x55; 16];
+        prediction.verdict = context_graph_mejepa::Verdict::Fail;
+        prediction.predicted_oracle_pass = 0.07;
+        prediction.calibrated_confidence = 0.93;
+        prediction.ood_score = 0.02;
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let cf_counts_before = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap()
+        });
+        persist_prediction_and_dda(db.clone(), &prediction);
+        let cf_counts_after = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap()
+        });
+        drop(db);
+
+        let session_id = hex::encode(prediction.session_id);
+        let happy_response = handlers
+            .call_mejepa_predict_latest(
+                Some(JsonRpcId::Number(550)),
+                json!({
+                    "sessionId": session_id,
+                    "limit": 1,
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        assert!(happy_response.error.is_none());
+        let happy_result = happy_response.result.unwrap();
+        let happy_structured = happy_result["structuredContent"].clone();
+
+        let cold_response = handlers
+            .call_mejepa_predict_latest(
+                Some(JsonRpcId::Number(551)),
+                json!({
+                    "sessionId": hex::encode([0x56; 16]),
+                    "limit": 1,
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        let cold_result = cold_response.result.unwrap();
+
+        let invalid_session_response = handlers
+            .call_mejepa_predict_latest(
+                Some(JsonRpcId::Number(552)),
+                json!({
+                    "sessionId": "not-hex",
+                    "limit": 1,
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        let invalid_session_result = invalid_session_response.result.unwrap();
+
+        let invalid_limit_response = handlers
+            .call_mejepa_predict_latest(
+                Some(JsonRpcId::Number(553)),
+                json!({
+                    "sessionId": session_id,
+                    "limit": 1001,
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        let invalid_limit_result = invalid_limit_response.result.unwrap();
+
+        let reopened = open_infer_rocksdb(&infer_db).unwrap();
+        let store = RocksDbInferStore::new(reopened.clone());
+        let persisted_predictions = context_graph_mejepa::MejepaStore::read_live_predictions(
+            &store,
+            prediction.session_id,
+            1,
+        )
+        .unwrap();
+        let session_known =
+            context_graph_mejepa::MejepaStore::session_known(&store, prediction.session_id)
+                .unwrap();
+        let independent_readback_equal = persisted_predictions == vec![prediction.clone()]
+            && session_known
+            && count_cf_any(reopened.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap() == 1;
+        drop(store);
+        drop(reopened);
+
+        let happy_pass = happy_result["isError"] == false
+            && happy_structured["session_known"] == json!(true)
+            && happy_structured["predictions"]
+                .as_array()
+                .map(|items| items.len())
+                == Some(1)
+            && happy_structured["predictions"][0]["verdict"] == json!("fail")
+            && (happy_structured["predictions"][0]["predicted_oracle_pass"]
+                .as_f64()
+                .unwrap_or_default()
+                - 0.07)
+                .abs()
+                < 0.001
+            && (happy_structured["predictions"][0]["calibrated_confidence"]
+                .as_f64()
+                .unwrap_or_default()
+                - 0.93)
+                .abs()
+                < 0.001
+            && happy_structured["slotAttributionSummaries"]
+                .as_array()
+                .map(|items| items.len())
+                == Some(1)
+            && happy_structured["slotAttributionSummaries"][0]["rejectionEvidenceCount"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1;
+        let boundary_cases = vec![
+            json!({
+                "case": "cold_start_session_returns_empty_prediction_list",
+                "expected": {"predictions": [], "session_known": false},
+                "actual": cold_result,
+                "pass": cold_result["isError"] == false
+                    && cold_result["structuredContent"]["session_known"] == json!(false)
+                    && cold_result["structuredContent"]["predictions"]
+                        .as_array()
+                        .map(|items| items.is_empty())
+                        == Some(true)
+            }),
+            json!({
+                "case": "invalid_session_id_fails_schema_guard",
+                "expected": "sessionId must be exactly 32 hexadecimal characters",
+                "actual": invalid_session_result,
+                "pass": invalid_session_result["isError"] == true
+                    && invalid_session_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("sessionId must be exactly 32 hexadecimal characters")
+            }),
+            json!({
+                "case": "invalid_limit_fails_schema_guard",
+                "expected": "limit must be in [1, 1000]",
+                "actual": invalid_limit_result,
+                "pass": invalid_limit_result["isError"] == true
+                    && invalid_limit_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("limit must be in [1, 1000]")
+            }),
+        ];
+        let all_boundaries_pass = boundary_cases
+            .iter()
+            .all(|case| case["pass"].as_bool() == Some(true));
+        let report = json!({
+            "task_id": "TASK-PY-G-055",
+            "issue": 274,
+            "started_at_unix_ms": started_at_unix_ms,
+            "run_root": run_root.display().to_string(),
+            "source_of_truth": {
+                "infer_db": infer_db.display().to_string(),
+                "live_prediction_cf": CF_MEJEPA_LIVE_PREDICTIONS,
+                "mcp_tool": tool_names::MEJEPA_PREDICT_LATEST
+            },
+            "trigger": "cargo test -p context-graph-mcp mejepa_predict_latest_reads_live_prediction_for_injection_fsv -- --nocapture",
+            "happy_path": [{
+                "case": "mcp_predict_latest_reads_cf_mejepa_live_predictions_for_session",
+                "expected": {
+                    "session_known": true,
+                    "prediction_count": 1,
+                    "verdict": "fail",
+                    "predicted_oracle_pass": 0.07,
+                    "calibrated_confidence": 0.93
+                },
+                "actual": happy_structured,
+                "pass": happy_pass
+            }],
+            "boundary_cases": boundary_cases,
+            "cf_counts_before": cf_counts_before,
+            "cf_counts_after": cf_counts_after,
+            "independent_readback_equal": independent_readback_equal,
+            "all_passed": happy_pass && all_boundaries_pass && independent_readback_equal
+        });
+        write_fsv_json(&artifact_path, &report);
+        let report_readback: Value =
+            serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
+        assert_eq!(
+            report_readback["all_passed"],
+            json!(true),
+            "{}",
+            serde_json::to_string_pretty(&report_readback).unwrap()
+        );
+    }
+
+    fn physical_file_summary(root: &Path) -> Value {
+        let mut file_count = 0u64;
+        let mut total_bytes = 0u64;
+        let mut sst_files = Vec::new();
+        collect_physical_files(root, &mut file_count, &mut total_bytes, &mut sst_files);
+        json!({
+            "root": root.display().to_string(),
+            "file_count": file_count,
+            "total_file_bytes": total_bytes,
+            "sst_files": sst_files
+        })
+    }
+
+    fn collect_physical_files(
+        root: &Path,
+        file_count: &mut u64,
+        total_bytes: &mut u64,
+        sst_files: &mut Vec<Value>,
+    ) {
+        for entry in fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                collect_physical_files(&path, file_count, total_bytes, sst_files);
+                continue;
+            }
+            *file_count += 1;
+            *total_bytes += metadata.len();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("sst") {
+                sst_files.push(json!({
+                    "path": path.display().to_string(),
+                    "bytes": metadata.len()
+                }));
+            }
+        }
+    }
+
+    fn contains_key(value: &serde_json::Value, needle: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .any(|(key, child)| key == needle || contains_key(child, needle)),
+            serde_json::Value::Array(items) => {
+                items.iter().any(|child| contains_key(child, needle))
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mejepa_system_cost_feedback_counter_writes_phase_f_fsv_artifact() {
+        let _guard = env_guard();
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let started_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let fsv_root =
+            PathBuf::from("/var/lib/contextgraph/fsv/phase-f-system-cost-producers-fsv");
+        fs::create_dir_all(&fsv_root).unwrap();
+        let run_root = fsv_root.join(format!(
+            "mcp-feedback-run-{}-{}",
+            started_at_unix_ms,
+            std::process::id()
+        ));
+        fs::create_dir_all(&run_root).unwrap();
+        let infer_db = run_root.join("infer-db");
+        std::env::set_var(ENV_INFER_DB, &infer_db);
+
+        let prediction = inspect_prediction_fixture([0x84; 16], "src/lib.rs#fn#feedback-counter");
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        persist_prediction_and_dda(db.clone(), &prediction);
+        let cf_counts_before = json!({
+            CF_MEJEPA_AGENT_FEEDBACK: count_cf_any(db.as_ref(), CF_MEJEPA_AGENT_FEEDBACK).unwrap(),
+            CF_MEJEPA_ACTIVE_LEARNING_QUEUE: count_cf_any(db.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_QUEUE).unwrap()
+        });
+        drop(db);
+
+        let mut expected_agent_feedback_tokens = 0_u64;
+        let mut final_snapshot = json!(null);
+        let mut final_structured = json!(null);
+        for idx in 0..50_u64 {
+            let args = json!({
+                "predictionId": hex::encode(prediction.prediction_id),
+                "feedbackKind": "confirmed",
+                "agentExplanation": format!("system cost feedback counter fsv event {idx}"),
+                "severity": if idx % 3 == 0 { "high" } else { "medium" },
+                "extraStructuredData": {"caseIndex": idx}
+            });
+            expected_agent_feedback_tokens += serde_json::to_vec(&args).unwrap().len() as u64;
+            let response = handlers
+                .call_mejepa_record_agent_feedback(Some(JsonRpcId::Number(840 + idx as i64)), args)
+                .await;
+            assert!(response.error.is_none());
+            let result = response.result.unwrap();
+            assert_eq!(result["isError"], json!(false), "{result}");
+            final_structured = result["structuredContent"].clone();
+            final_snapshot = final_structured["systemCostSnapshot"].clone();
+        }
+
+        let reopened = open_infer_rocksdb(&infer_db).unwrap();
+        for cf_name in [
+            CF_MEJEPA_AGENT_FEEDBACK,
+            CF_MEJEPA_ACTIVE_LEARNING_QUEUE,
+            CF_MEJEPA_ACTIVE_LEARNING_EVICTIONS,
+            CF_MEJEPA_OOD_ESCALATIONS,
+        ] {
+            let cf = cf_handle(reopened.as_ref(), cf_name).unwrap();
+            reopened.flush_cf(cf).unwrap();
+        }
+        let feedback_rows = count_cf_any(reopened.as_ref(), CF_MEJEPA_AGENT_FEEDBACK).unwrap();
+        let queue_rows = count_cf_any(reopened.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_QUEUE).unwrap();
+        let cf_counts_after = json!({
+            CF_MEJEPA_AGENT_FEEDBACK: feedback_rows,
+            CF_MEJEPA_ACTIVE_LEARNING_QUEUE: queue_rows
+        });
+        drop(reopened);
+
+        let physical = physical_file_summary(&run_root);
+        let rocksdb_writes = final_snapshot["rocksdbWritesTotal"].as_u64().unwrap_or(0);
+        let rocksdb_bytes = final_snapshot["rocksdbBytesWrittenTotal"]
+            .as_u64()
+            .unwrap_or(0);
+        let actual_tokens = final_snapshot["agentFeedbackTokensTotal"]
+            .as_u64()
+            .unwrap_or(0);
+        let happy_pass = feedback_rows == 50
+            && queue_rows == 1
+            && actual_tokens == expected_agent_feedback_tokens
+            && rocksdb_writes >= 100
+            && rocksdb_bytes > 0
+            && final_structured["sourceOfTruth"]["feedbackCf"] == json!(CF_MEJEPA_AGENT_FEEDBACK)
+            && final_structured["systemCostSnapshot"]["agentFeedbackTokensTotal"]
+                == json!(expected_agent_feedback_tokens);
+        let boundary_cases = vec![
+            json!({
+                "case": "feedback_rows_reopen_to_exact_count",
+                "sot": CF_MEJEPA_AGENT_FEEDBACK,
+                "expected": 50,
+                "actual": feedback_rows,
+                "pass": feedback_rows == 50
+            }),
+            json!({
+                "case": "request_body_token_counter_matches_independent_sum",
+                "sot": "SystemCostCounters.agentFeedbackTokensTotal",
+                "expected": expected_agent_feedback_tokens,
+                "actual": actual_tokens,
+                "pass": actual_tokens == expected_agent_feedback_tokens
+            }),
+            json!({
+                "case": "feedback_batch_write_counter_records_feedback_and_queue_puts",
+                "sot": "SystemCostCounters.rocksdbWritesTotal",
+                "expected_minimum": 100,
+                "actual": rocksdb_writes,
+                "pass": rocksdb_writes >= 100
+            }),
+            json!({
+                "case": "feedback_batch_byte_counter_is_nonzero",
+                "sot": "SystemCostCounters.rocksdbBytesWrittenTotal",
+                "expected": "> 0",
+                "actual": rocksdb_bytes,
+                "pass": rocksdb_bytes > 0
+            }),
+        ];
+        let all_passed = happy_pass
+            && boundary_cases
+                .iter()
+                .all(|case| case["pass"].as_bool() == Some(true));
+        let artifact_path = fsv_root.join("feedback_counter_fsv.json");
+        let report = json!({
+            "fsv_root": fsv_root.display().to_string(),
+            "task_id": "TASK-OBS-017",
+            "started_at_unix_ms": started_at_unix_ms,
+            "build_release_sha": git_head_short_for_test(),
+            "happy_path": [{
+                "case": "feedback_handler_records_tokens_and_rocksdb_write_counters",
+                "sot": format!("{CF_MEJEPA_AGENT_FEEDBACK} + SystemCostCounters"),
+                "before": cf_counts_before,
+                "trigger": "50 mejepa_record_agent_feedback calls through handler",
+                "after": {
+                    "cf_counts_after": cf_counts_after,
+                    "system_cost_snapshot": final_snapshot
+                },
+                "expected": {
+                    "feedback_rows": 50,
+                    "queue_rows": 1,
+                    "agent_feedback_tokens_total": expected_agent_feedback_tokens,
+                    "rocksdb_writes_total_min": 100,
+                    "rocksdb_bytes_written_total": "> 0"
+                },
+                "actual": {
+                    "feedback_rows": feedback_rows,
+                    "queue_rows": queue_rows,
+                    "agent_feedback_tokens_total": actual_tokens,
+                    "rocksdb_writes_total": rocksdb_writes,
+                    "rocksdb_bytes_written_total": rocksdb_bytes
+                },
+                "pass": happy_pass,
+                "evidence_path": run_root.display().to_string()
+            }],
+            "boundary_cases": boundary_cases,
+            "cf_counts_before": cf_counts_before,
+            "cf_counts_after": cf_counts_after,
+            "physical_artifacts": physical,
+            "readback_equal": happy_pass,
+            "all_passed": all_passed
+        });
+        write_fsv_json(&artifact_path, &report);
+        let report_readback: Value =
+            serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
+        assert_eq!(
+            report_readback["all_passed"],
+            json!(true),
+            "{report_readback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mejepa_inspect_prediction_writes_phase_f_fsv_artifact() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let started_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let fsv_root =
+            PathBuf::from("/var/lib/contextgraph/fsv/phase-f-inspect-prediction-fsv");
+        fs::create_dir_all(&fsv_root).unwrap();
+        let run_root = fsv_root.join(format!("run-{}-{}", started_at_unix_ms, std::process::id()));
+        fs::create_dir_all(&run_root).unwrap();
+        let infer_db = run_root.join("infer-db");
+
+        let prediction = inspect_prediction_fixture([0x44; 16], "src/lib.rs#fn#0");
+        let missing_dda_prediction =
+            inspect_prediction_fixture([0x45; 16], "src/lib.rs#fn#missing-dda");
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let cf_counts_before = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap(),
+            CF_MEJEPA_DDA_SIGNALS: count_cf_any(db.as_ref(), CF_MEJEPA_DDA_SIGNALS).unwrap()
+        });
+        persist_prediction_and_dda(db.clone(), &prediction);
+        let store = RocksDbInferStore::new(db.clone());
+        context_graph_mejepa::MejepaStore::write_live_prediction(&store, &missing_dda_prediction)
+            .unwrap();
+        let cf_counts_after = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap(),
+            CF_MEJEPA_DDA_SIGNALS: count_cf_any(db.as_ref(), CF_MEJEPA_DDA_SIGNALS).unwrap()
+        });
+        drop(store);
+        drop(db);
+
+        let reopened = open_infer_rocksdb(&infer_db).unwrap();
+        let reopened_prediction =
+            find_prediction_row_by_id(reopened.as_ref(), PredictionId(prediction.prediction_id))
+                .unwrap();
+        let (_dda_key, reopened_dda) = read_required_dda_signals(
+            reopened.as_ref(),
+            &PanelId(prediction.source_panel_sha),
+            &prediction.covered_chunks[0],
+        )
+        .unwrap();
+        let independent_reopen_equal = reopened_prediction.prediction == prediction
+            && reopened_dda.per_embedder_cosine == vec![0.91, 0.82, 0.73];
+        drop(reopened);
+
+        let prediction_id = hex::encode(prediction.prediction_id);
+        let happy_response = handlers
+            .call_mejepa_inspect_prediction(
+                Some(JsonRpcId::Number(440)),
+                json!({"predictionId": prediction_id, "dbPath": infer_db.display().to_string()}),
+            )
+            .await;
+        assert!(happy_response.error.is_none());
+        let happy_result = happy_response.result.unwrap();
+        let happy_structured = happy_result["structuredContent"].clone();
+        let happy_pass = happy_result["isError"] == false
+            && happy_structured["sourceOfTruth"]["readbackVerified"] == true
+            && happy_structured["sourceOfTruth"]["livePredictionCf"]
+                == json!(CF_MEJEPA_LIVE_PREDICTIONS)
+            && happy_structured["sourceOfTruth"]["ddaSignalsCf"] == json!(CF_MEJEPA_DDA_SIGNALS)
+            && happy_structured["versions"]["predictorVersion"]
+                == json!("inspect-test-predictor-v1")
+            && happy_structured["witnessHash"] == json!(hex::encode([0x77; 32]))
+            && happy_structured["contributingChunks"]
+                .as_array()
+                .map(|chunks| chunks.len())
+                == Some(1)
+            && happy_structured["contributingChunks"][0]["ddaSignals"]["perEmbedderCosineVector"]
+                .as_array()
+                .map(|values| values.len())
+                == Some(3)
+            && happy_structured["contributingChunks"][0]["tctCellsConsulted"]
+                .as_array()
+                .map(|values| values.len())
+                == Some(1)
+            && happy_structured["slotAttributions"]
+                .as_array()
+                .map(|items| items.len())
+                .unwrap_or_default()
+                >= 1
+            && happy_structured["tctTrace"]["slotAttributionSummary"]["rejectionEvidenceCount"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1;
+
+        let malformed_response = handlers
+            .call_mejepa_inspect_prediction(
+                Some(JsonRpcId::Number(441)),
+                json!({"predictionId": "not-hex", "dbPath": infer_db.display().to_string()}),
+            )
+            .await;
+        let malformed_result = malformed_response.result.unwrap();
+
+        let missing_prediction_response = handlers
+            .call_mejepa_inspect_prediction(
+                Some(JsonRpcId::Number(442)),
+                json!({
+                    "predictionId": hex::encode([0xaa; 16]),
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        let missing_prediction_result = missing_prediction_response.result.unwrap();
+
+        let missing_dda_response = handlers
+            .call_mejepa_inspect_prediction(
+                Some(JsonRpcId::Number(443)),
+                json!({
+                    "predictionId": hex::encode(missing_dda_prediction.prediction_id),
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        let missing_dda_result = missing_dda_response.result.unwrap();
+
+        let unknown_field_response = handlers
+            .call_mejepa_inspect_prediction(
+                Some(JsonRpcId::Number(444)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "dbPath": infer_db.display().to_string(),
+                    "extra": true
+                }),
+            )
+            .await;
+        let unknown_field_result = unknown_field_response.result.unwrap();
+
+        let boundary_cases = vec![
+            json!({
+                "case": "malformed_prediction_id_fails_closed",
+                "expected": "predictionId must be exactly 32 hexadecimal characters",
+                "actual": malformed_result,
+                "pass": malformed_result["isError"] == true
+                    && malformed_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("predictionId must be exactly 32 hexadecimal characters")
+            }),
+            json!({
+                "case": "missing_prediction_row_fails_closed",
+                "expected": "not found in CF_MEJEPA_LIVE_PREDICTIONS",
+                "actual": missing_prediction_result,
+                "pass": missing_prediction_result["isError"] == true
+                    && missing_prediction_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("CF_MEJEPA_LIVE_PREDICTIONS")
+            }),
+            json!({
+                "case": "missing_dda_signal_row_fails_closed",
+                "expected": "MEJEPA_INSPECT_PREDICTION_DDA_MISSING",
+                "actual": missing_dda_result,
+                "pass": missing_dda_result["isError"] == true
+                    && missing_dda_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("MEJEPA_INSPECT_PREDICTION_DDA_MISSING")
+            }),
+            json!({
+                "case": "unknown_request_field_fails_schema_validation",
+                "expected": "schema validation failed",
+                "actual": unknown_field_result,
+                "pass": unknown_field_result["isError"] == true
+                    && unknown_field_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("schema validation failed")
+            }),
+        ];
+        let all_boundaries_pass = boundary_cases
+            .iter()
+            .all(|case| case["pass"].as_bool() == Some(true));
+        let report = json!({
+            "fsv_root": fsv_root,
+            "task_id": "TASK-OBS-009",
+            "started_at_unix_ms": started_at_unix_ms,
+            "build_release_sha": std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|text| text.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            "happy_path": [{
+                "case": "inspect_prediction_reads_live_prediction_and_dda_vectors",
+                "sot": format!("{CF_MEJEPA_LIVE_PREDICTIONS} + {CF_MEJEPA_DDA_SIGNALS}"),
+                "before": {
+                    "db_path": infer_db.display().to_string(),
+                    "prediction_id": hex::encode(prediction.prediction_id),
+                    "covered_chunks": prediction.covered_chunks.clone()
+                },
+                "trigger": "cargo test -p context-graph-mcp mejepa_inspect_prediction_writes_phase_f_fsv_artifact -- --nocapture",
+                "after": happy_structured,
+                "expected": {
+                    "readbackVerified": true,
+                    "chunk_count": 1,
+                    "per_embedder_vector_len": 3,
+                    "tct_cell_count": 1
+                },
+                "actual": happy_pass,
+                "pass": happy_pass,
+                "evidence_path": run_root.display().to_string()
+            }],
+            "boundary_cases": boundary_cases,
+            "all_passed": happy_pass && all_boundaries_pass,
+            "cf_counts_before": cf_counts_before,
+            "cf_counts_after": cf_counts_after,
+            "readback_equal": independent_reopen_equal,
+            "physical_artifacts": {
+                "infer_db_exists": infer_db.exists(),
+                "run_root": run_root.display().to_string(),
+                "infer_db": physical_file_summary(&infer_db)
+            }
+        });
+        assert_eq!(
+            report["all_passed"],
+            true,
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap()
+        );
+        let evidence_path = fsv_root.join("inspect_prediction_fsv.json");
+        write_fsv_json(&evidence_path, &report);
+        let readback: Value = serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(readback["all_passed"], true);
+        assert_eq!(readback["readback_equal"], true);
+    }
+
+    #[tokio::test]
+    async fn mejepa_replay_prediction_api_reads_byte_equal_source_of_truth() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let temp = TempDir::new().unwrap();
+        let infer_db = temp.path().join("infer-db");
+        let prediction = inspect_prediction_fixture([0x46; 16], "src/lib.rs#fn#replay");
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        persist_prediction_and_dda(db.clone(), &prediction);
+        drop(db);
+
+        let response = handlers
+            .call_mejepa_replay_prediction(
+                Some(JsonRpcId::Number(460)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["byteEqual"], true);
+        assert_eq!(structured["semanticEqual"], true);
+        assert_eq!(
+            structured["columnFamily"],
+            json!(CF_MEJEPA_LIVE_PREDICTIONS)
+        );
+        assert_eq!(
+            structured["predictionId"],
+            json!(hex::encode(prediction.prediction_id))
+        );
+
+        let missing_response = handlers
+            .call_mejepa_replay_prediction(
+                Some(JsonRpcId::Number(461)),
+                json!({
+                    "predictionId": hex::encode([0xee; 16]),
+                    "dbPath": infer_db.display().to_string()
+                }),
+            )
+            .await;
+        let missing_result = missing_response.result.unwrap();
+        assert_eq!(missing_result["isError"], true);
+        assert!(missing_result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("MEJEPA_PREDICTION_REPLAY_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn mejepa_operator_override_prediction_writes_phase_f_fsv_artifact() {
+        let _guard = env_guard();
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let started_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let fsv_root = PathBuf::from("/var/lib/contextgraph/fsv/phase-f-operator-override-fsv");
+        fs::create_dir_all(&fsv_root).unwrap();
+        let run_root = fsv_root.join(format!(
+            "mcp-run-{}-{}",
+            started_at_unix_ms,
+            std::process::id()
+        ));
+        fs::create_dir_all(&run_root).unwrap();
+        let infer_db = run_root.join("infer-db");
+        let agents_config = run_root.join("agents.toml");
+        let operator_psk = "phase-f-operator-override-secret";
+        write_single_agent_config(&agents_config, "operator-1", operator_psk, true);
+        std::env::set_var(
+            crate::handlers::tools::mejepa_agent_identity::ENV_MEJEPA_AGENTS_CONFIG,
+            &agents_config,
+        );
+
+        let prediction = inspect_prediction_fixture([0x60; 16], "src/lib.rs#fn#override");
+        let db = open_infer_rocksdb(&infer_db).unwrap();
+        let cf_counts_before = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(db.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap(),
+            CF_MEJEPA_OPERATOR_OVERRIDES: count_cf_any(db.as_ref(), CF_MEJEPA_OPERATOR_OVERRIDES).unwrap(),
+            CF_MEJEPA_ACTIVE_LEARNING_LABELS: count_cf_any(db.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_LABELS).unwrap()
+        });
+        persist_prediction_and_dda(db.clone(), &prediction);
+        drop(db);
+
+        let response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(600)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "dbPath": infer_db.display().to_string(),
+                    "overrideVerdict": "fail",
+                    "reason": "operator observed oracle failure",
+                    "operatorId": "operator-1",
+                    "identityAttestation": signed_identity_json(
+                        operator_psk,
+                        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+                        "operator-1",
+                        "operator-override-fsv-session",
+                        "nonce-operator-override-happy"
+                    )
+                }),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        let structured = result["structuredContent"].clone();
+        let happy_pass = result["isError"] == false
+            && structured["samplingWeightMultiplier"].as_f64() == Some(6.0)
+            && structured["operatorOverrideCountAfter"].as_u64() == Some(1)
+            && structured["report"]["operatorOverrideCount"].as_u64() == Some(1)
+            && structured["report"]["activeLearningLabelMethod"] == json!("human")
+            && structured["report"]["activeLearningOracleOutcome"] == json!("fail")
+            && structured["sourceOfTruth"]["overrideCf"] == json!(CF_MEJEPA_OPERATOR_OVERRIDES)
+            && structured["sourceOfTruth"]["labelCf"] == json!(CF_MEJEPA_ACTIVE_LEARNING_LABELS)
+            && structured["readback"]["overrideFlagForNextBatch"] == json!(true)
+            && structured["readback"]["override"]["reason"]
+                == json!("operator observed oracle failure");
+        assert!(happy_pass, "{structured}");
+
+        let reopened = open_infer_rocksdb(&infer_db).unwrap();
+        let override_readback =
+            load_operator_override(reopened.as_ref(), PredictionId(prediction.prediction_id))
+                .unwrap()
+                .unwrap();
+        let eval_store = RocksDbEvalStore::new(reopened.clone()).unwrap();
+        let label_readback = eval_store.load_label(&prediction.task_id).unwrap().unwrap();
+        let cf_counts_after = json!({
+            CF_MEJEPA_LIVE_PREDICTIONS: count_cf_any(reopened.as_ref(), CF_MEJEPA_LIVE_PREDICTIONS).unwrap(),
+            CF_MEJEPA_OPERATOR_OVERRIDES: count_cf_any(reopened.as_ref(), CF_MEJEPA_OPERATOR_OVERRIDES).unwrap(),
+            CF_MEJEPA_ACTIVE_LEARNING_LABELS: count_cf_any(reopened.as_ref(), CF_MEJEPA_ACTIVE_LEARNING_LABELS).unwrap()
+        });
+        let independent_reopen_equal = override_readback.reason
+            == "operator observed oracle failure"
+            && override_readback.override_verdict == OverrideVerdict::Fail
+            && label_readback.method == LabelMethod::Human
+            && label_readback.oracle_outcome == context_graph_mejepa::OracleOutcome::Fail;
+        drop(eval_store);
+        drop(reopened);
+
+        let malformed_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(601)),
+                json!({
+                    "predictionId": "not-hex",
+                    "dbPath": infer_db.display().to_string(),
+                    "overrideVerdict": "fail",
+                    "reason": "x",
+                    "operatorId": "operator-1",
+                    "identityAttestation": signed_identity_json(
+                        operator_psk,
+                        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+                        "operator-1",
+                        "operator-override-fsv-session",
+                        "nonce-operator-override-missing-prediction"
+                    )
+                }),
+            )
+            .await;
+        let malformed_result = malformed_response.result.unwrap();
+
+        let missing_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(602)),
+                json!({
+                    "predictionId": hex::encode([0x61; 16]),
+                    "dbPath": infer_db.display().to_string(),
+                    "overrideVerdict": "fail",
+                    "reason": "x",
+                    "operatorId": "operator-1",
+                    "identityAttestation": signed_identity_json(
+                        operator_psk,
+                        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+                        "operator-1",
+                        "operator-override-fsv-session",
+                        "nonce-operator-override-missing-prediction"
+                    )
+                }),
+            )
+            .await;
+        let missing_result = missing_response.result.unwrap();
+
+        let empty_reason_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(603)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "dbPath": infer_db.display().to_string(),
+                    "overrideVerdict": "fail",
+                    "reason": "  ",
+                    "operatorId": "operator-1",
+                    "identityAttestation": signed_identity_json(
+                        operator_psk,
+                        tool_names::MEJEPA_OPERATOR_OVERRIDE_PREDICTION,
+                        "operator-1",
+                        "operator-override-fsv-session",
+                        "nonce-operator-override-empty-reason"
+                    )
+                }),
+            )
+            .await;
+        let empty_reason_result = empty_reason_response.result.unwrap();
+
+        let unknown_field_response = handlers
+            .call_mejepa_operator_override_prediction(
+                Some(JsonRpcId::Number(604)),
+                json!({
+                    "predictionId": hex::encode(prediction.prediction_id),
+                    "dbPath": infer_db.display().to_string(),
+                    "overrideVerdict": "fail",
+                    "reason": "x",
+                    "operatorId": "operator-1",
+                    "extra": true
+                }),
+            )
+            .await;
+        let unknown_field_result = unknown_field_response.result.unwrap();
+
+        let boundary_cases = vec![
+            json!({
+                "case": "malformed_prediction_id_fails_closed",
+                "expected": "predictionId must be exactly 32 hexadecimal characters",
+                "actual": malformed_result,
+                "pass": malformed_result["isError"] == true
+                    && malformed_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("predictionId must be exactly 32 hexadecimal characters")
+            }),
+            json!({
+                "case": "missing_prediction_row_fails_closed",
+                "expected": "not found in CF_MEJEPA_LIVE_PREDICTIONS",
+                "actual": missing_result,
+                "pass": missing_result["isError"] == true
+                    && missing_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("was not found in CF_MEJEPA_LIVE_PREDICTIONS")
+            }),
+            json!({
+                "case": "empty_reason_fails_closed",
+                "expected": "MEJEPA_OPERATOR_OVERRIDE_REASON_EMPTY",
+                "actual": empty_reason_result,
+                "pass": empty_reason_result["isError"] == true
+                    && empty_reason_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("MEJEPA_OPERATOR_OVERRIDE_REASON_EMPTY")
+            }),
+            json!({
+                "case": "unknown_request_field_fails_schema_validation",
+                "expected": "schema validation failed",
+                "actual": unknown_field_result,
+                "pass": unknown_field_result["isError"] == true
+                    && unknown_field_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("schema validation failed")
+            }),
+        ];
+        let all_boundaries_pass = boundary_cases
+            .iter()
+            .all(|case| case["pass"].as_bool() == Some(true));
+        let report = json!({
+            "fsv_root": fsv_root,
+            "task_id": "TASK-PREDICT-012",
+            "issue": 60,
+            "started_at_unix_ms": started_at_unix_ms,
+            "build_release_sha": std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|text| text.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            "happy_path": [{
+                "case": "mcp_operator_override_persists_override_and_human_label",
+                "sot": format!("{CF_MEJEPA_OPERATOR_OVERRIDES} + {CF_MEJEPA_ACTIVE_LEARNING_LABELS}"),
+                "before": {
+                    "db_path": infer_db.display().to_string(),
+                    "prediction_id": hex::encode(prediction.prediction_id)
+                },
+                "trigger": "cargo test -p context-graph-mcp mejepa_operator_override_prediction_writes_phase_f_fsv_artifact -- --nocapture",
+                "after": structured,
+                "expected": {
+                    "sampling_weight_multiplier": 6.0,
+                    "override_count_after": 1,
+                    "label_method": "human",
+                    "label_oracle_outcome": "fail"
+                },
+                "actual": happy_pass,
+                "pass": happy_pass,
+                "evidence_path": run_root.display().to_string()
+            }],
+            "boundary_cases": boundary_cases,
+            "all_passed": happy_pass && all_boundaries_pass && independent_reopen_equal,
+            "cf_counts_before": cf_counts_before,
+            "cf_counts_after": cf_counts_after,
+            "readback_equal": independent_reopen_equal,
+            "physical_artifacts": {
+                "infer_db_exists": infer_db.exists(),
+                "run_root": run_root.display().to_string(),
+                "infer_db": physical_file_summary(&infer_db)
+            }
+        });
+        let evidence_path = fsv_root.join("operator_override_mcp_fsv.json");
+        write_fsv_json(&evidence_path, &report);
+        let readback: Value = serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(
+            readback["all_passed"],
+            true,
+            "{}",
+            serde_json::to_string_pretty(&readback).unwrap()
+        );
+        assert_eq!(readback["readback_equal"], true);
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_returns_summary_for_loaded_version() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let constellation = constellation(SystemTime::now(), 1);
+        persist(&temp, &constellation);
+        let output = run_constellation_inspect(
+            temp.path(),
+            Some(&hex::encode(constellation.version_id())),
+            &constellation.corpus_provenance.embedder_versions,
+        )
+        .unwrap();
+        assert_eq!(
+            output["version_id"],
+            hex::encode(constellation.version_id())
+        );
+        assert_eq!(output["cell_counts"]["panel_level_cells"], 63);
+        assert_eq!(output["cell_counts"]["per_chunk_type_cells"], 21);
+        assert_eq!(output["sample_support_histogram"]["n_50_plus"], 21);
+        assert_eq!(
+            output["per_chunk_type_threshold_summary"]["function"]["n_cells"],
+            21
+        );
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_does_not_leak_raw_centroid_vectors() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let constellation = constellation(SystemTime::now(), 2);
+        persist(&temp, &constellation);
+        let output = run_constellation_inspect(
+            temp.path(),
+            Some(&hex::encode(constellation.version_id())),
+            &constellation.corpus_provenance.embedder_versions,
+        )
+        .unwrap();
+        assert!(!contains_key(&output, "values"));
+        assert!(!contains_key(&output, "per_category_centroids"));
+        assert!(!contains_key(&output, "per_chunk_type_centroids"));
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_loads_newest_frozen_at_when_version_omitted() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let older = constellation(SystemTime::now() - Duration::from_secs(60), 3);
+        let newer = constellation(SystemTime::now(), 4);
+        persist(&temp, &older);
+        persist(&temp, &newer);
+        let output = run_constellation_inspect(
+            temp.path(),
+            None,
+            &newer.corpus_provenance.embedder_versions,
+        )
+        .unwrap();
+        assert_eq!(output["version_id"], hex::encode(newer.version_id()));
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_surfaces_provenance_mismatch() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let constellation = constellation(SystemTime::now(), 5);
+        persist(&temp, &constellation);
+        let mut runtime = constellation.corpus_provenance.embedder_versions.clone();
+        runtime.insert(EmbedderId::E3, [99; 32]);
+        let err = run_constellation_inspect(
+            temp.path(),
+            Some(&hex::encode(constellation.version_id())),
+            &runtime,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "MEJEPA_TCT_PROVENANCE_MISMATCH");
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_rejects_stale_constellation() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let stale = constellation(SystemTime::now() - Duration::from_secs(91 * 86_400), 6);
+        persist(&temp, &stale);
+        let err = run_constellation_inspect(
+            temp.path(),
+            Some(&hex::encode(stale.version_id())),
+            &stale.corpus_provenance.embedder_versions,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "MEJEPA_INFER_GTAU_STALE_CONSTELLATION");
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_rejects_malformed_version_id() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let constellation = constellation(SystemTime::now(), 7);
+        persist(&temp, &constellation);
+        let err = run_constellation_inspect(
+            temp.path(),
+            Some("not-a-64-byte-hex-digest"),
+            &constellation.corpus_provenance.embedder_versions,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "MEJEPA_TCT_INVALID_INPUT");
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_requires_db_path_or_env() {
+        let _guard = env_guard();
+        let err = resolve_tct_db_path(None).unwrap_err();
+        assert!(err.contains(ENV_TCT_DB));
+        assert!(err.contains("refusing to guess"));
+    }
+
+    #[test]
+    fn mejepa_constellation_inspect_rejects_empty_store() {
+        let _guard = env_guard();
+        let temp = TempDir::new().unwrap();
+        let runtime = versions(8);
+        let err = run_constellation_inspect(temp.path(), None, &runtime).unwrap_err();
+        assert_eq!(err.code(), "MEJEPA_TCT_MISSING_CENTROID");
+    }
+
+    #[test]
+    fn mejepa_heal_status_and_rollback_read_persisted_source_of_truth() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("heal-db");
+        let chain_path = temp.path().join("chain.bin");
+        let storage = HealRocksStore::open(&db_path).unwrap();
+        let mut witness_chain = WitnessChainAppender::new(chain_path.clone()).unwrap();
+        let holdout = context_graph_mejepa::heal::HoldoutDataset::try_new(
+            (0..50)
+                .map(|idx| context_graph_mejepa::heal::HoldoutExample {
+                    predicted: vec![context_graph_mejepa::OracleOutcome::Pass],
+                    actual: if idx < 36 {
+                        context_graph_mejepa::OracleOutcome::Pass
+                    } else {
+                        context_graph_mejepa::OracleOutcome::Fail
+                    },
+                    ood_score: 0.05,
+                    calibration_nonconformity_score: if idx < 36 { 0.05 } else { 0.95 },
+                    cell_key: "known_good::python".to_string(),
+                })
+                .collect(),
+            [7; 32],
+        )
+        .unwrap();
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(PromotionLockState::default()));
+        let mut promoter = AbcPromoter::try_new(0.1, PromotionGate::default()).unwrap();
+        let report = promoter
+            .retrain_and_promote(context_graph_mejepa::heal::RetrainPromoteRequest {
+                trigger_reason: context_graph_mejepa::heal::TriggerReason::DriftHard,
+                current_weights: &[0.2; 16],
+                storage,
+                witness_chain: &mut witness_chain,
+                holdout,
+                lock,
+                calibration_version: "mcp-test-calibration",
+            })
+            .unwrap();
+
+        let status = run_heal_status(&db_path).unwrap();
+        assert_eq!(status["cfCounts"][CF_MEJEPA_HEAL_REPORTS], 1);
+        assert_eq!(
+            status["latestHealReport"]["witnessChainOffset"],
+            serde_json::json!(report.witness_chain_offset)
+        );
+        let rollback = run_rollback_to(&db_path, chain_path, report.witness_chain_offset).unwrap();
+        assert_eq!(rollback["targetWitnessChainOffset"], 0);
+        let status_after = run_heal_status(&db_path).unwrap();
+        assert!(
+            status_after["cfCounts"][CF_MEJEPA_ACTIVE_POINTERS]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert!(status_after["activePointers"]
+            .get("active_weights")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn mejepa_daemon_status_aggregates_real_sources_of_truth() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let temp = TempDir::new().unwrap();
+        let infer_db = temp.path().join("infer-db");
+        let panel_db = temp.path().join("panel-db");
+        let heal_db = temp.path().join("heal-db");
+        let quota_db = temp.path().join("quota-db");
+        let archive_root = temp.path().join("archive");
+
+        let infer = open_infer_rocksdb(&infer_db).unwrap();
+        drop(infer);
+        let panel =
+            context_graph_mejepa_instruments::panel_store::PanelStore::open(&panel_db).unwrap();
+        drop(panel);
+        let heal = HealRocksStore::open(&heal_db).unwrap();
+        drop(heal);
+
+        let response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(40)),
+                json!({
+                    "inferDbPath": infer_db,
+                    "panelDbPath": panel_db,
+                    "healDbPath": heal_db,
+                    "quotaDbPath": quota_db,
+                    "archiveRoot": archive_root,
+                    "includeVram": false
+                }),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["overallStatus"], "healthy");
+        assert_eq!(structured["components"]["runtime"]["status"], "healthy");
+        assert_eq!(structured["components"]["subscriber"]["status"], "healthy");
+        assert_eq!(structured["components"]["heal"]["status"], "healthy");
+        assert_eq!(structured["components"]["quota"]["status"], "healthy");
+        assert_eq!(structured["components"]["vram"]["status"], "disabled");
+        assert_eq!(
+            structured["components"]["subscriber"]["data"]["source_of_truth"],
+            json!(format!("file:{}", temp.path().join("infer-db").display()))
+        );
+    }
+
+    #[tokio::test]
+    async fn mejepa_daemon_status_reports_missing_component_sots() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let temp = TempDir::new().unwrap();
+        let bad_infer_db = temp.path().join("not-a-rocksdb-infer-file");
+        let bad_heal_db = temp.path().join("not-a-rocksdb-heal-file");
+        let quota_db = temp.path().join("quota-db");
+        let nested_archive_root = quota_db.join("archive");
+        std::fs::write(&bad_infer_db, b"not rocksdb").unwrap();
+        std::fs::write(&bad_heal_db, b"not rocksdb").unwrap();
+        let response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(41)),
+                json!({
+                    "inferDbPath": bad_infer_db,
+                    "healDbPath": bad_heal_db,
+                    "quotaDbPath": quota_db,
+                    "archiveRoot": nested_archive_root,
+                    "includeVram": false
+                }),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["overallStatus"], "degraded");
+        assert_eq!(
+            structured["components"]["subscriber"]["errorCode"],
+            "MEJEPA_DAEMON_STATUS_SUBSCRIBER_READ_FAILED"
+        );
+        assert_eq!(
+            structured["components"]["quota"]["errorCode"],
+            "MEJEPA_HYGIENE_INVALID_CONFIG"
+        );
+    }
+
+    #[tokio::test]
+    async fn mejepa_daemon_status_rejects_unknown_args() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(42)),
+                json!({"includeVram": false, "unexpected": true}),
+            )
+            .await;
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("schema validation failed"));
+    }
+
+    #[tokio::test]
+    async fn mejepa_daemon_status_writes_phase_f_fsv_artifact() {
+        let (handlers, _handler_tempdir) =
+            crate::handlers::tests::create_protocol_test_handlers().await;
+        let started_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let fsv_root = PathBuf::from("/var/lib/contextgraph/fsv/phase-f-daemon-status-fsv");
+        std::fs::create_dir_all(&fsv_root).unwrap();
+        let run_root = fsv_root.join(format!("run-{}-{}", started_at_unix_ms, std::process::id()));
+        std::fs::create_dir_all(&run_root).unwrap();
+
+        let infer_db = run_root.join("infer-db");
+        let panel_db = run_root.join("panel-db");
+        let heal_db = run_root.join("heal-db");
+        let quota_db = run_root.join("quota-db");
+        let archive_root = run_root.join("archive");
+
+        let infer = open_infer_rocksdb(&infer_db).unwrap();
+        drop(infer);
+        let panel =
+            context_graph_mejepa_instruments::panel_store::PanelStore::open(&panel_db).unwrap();
+        drop(panel);
+        let heal = HealRocksStore::open(&heal_db).unwrap();
+        drop(heal);
+
+        let happy_response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(43)),
+                json!({
+                    "inferDbPath": infer_db,
+                    "panelDbPath": panel_db,
+                    "healDbPath": heal_db,
+                    "quotaDbPath": quota_db,
+                    "archiveRoot": archive_root,
+                    "includeVram": false
+                }),
+            )
+            .await;
+        assert!(happy_response.error.is_none());
+        let happy_result = happy_response.result.unwrap();
+        let happy_structured = happy_result["structuredContent"].clone();
+        let happy_pass = happy_result["isError"] == false
+            && happy_structured["overallStatus"] == "healthy"
+            && happy_structured["components"]["runtime"]["status"] == "healthy"
+            && happy_structured["components"]["subscriber"]["status"] == "healthy"
+            && happy_structured["components"]["heal"]["status"] == "healthy"
+            && happy_structured["components"]["quota"]["status"] == "healthy"
+            && happy_structured["components"]["vram"]["status"] == "disabled";
+
+        let empty_path_response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(44)),
+                json!({"inferDbPath": "", "includeVram": false}),
+            )
+            .await;
+        assert!(empty_path_response.error.is_none());
+        let empty_path_result = empty_path_response.result.unwrap();
+
+        let unknown_response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(45)),
+                json!({"includeVram": false, "unexpected": true}),
+            )
+            .await;
+        assert!(unknown_response.error.is_none());
+        let unknown_result = unknown_response.result.unwrap();
+
+        let bad_infer_db = run_root.join("not-a-rocksdb-infer-file");
+        let bad_heal_db = run_root.join("not-a-rocksdb-heal-file");
+        std::fs::write(&bad_infer_db, b"not rocksdb").unwrap();
+        std::fs::write(&bad_heal_db, b"not rocksdb").unwrap();
+        let bad_response = handlers
+            .call_mejepa_daemon_status(
+                Some(JsonRpcId::Number(46)),
+                json!({
+                    "inferDbPath": bad_infer_db,
+                    "healDbPath": bad_heal_db,
+                    "quotaDbPath": run_root.join("bad-quota-db"),
+                    "archiveRoot": run_root.join("bad-quota-db/archive"),
+                    "includeVram": false
+                }),
+            )
+            .await;
+        assert!(bad_response.error.is_none());
+        let bad_structured = bad_response.result.unwrap()["structuredContent"].clone();
+
+        let boundary_cases = vec![
+            json!({
+                "case": "empty_infer_path_fails_validation",
+                "expected": "inferDbPath must be a non-empty path",
+                "actual": empty_path_result,
+                "pass": empty_path_result["isError"] == true
+                    && empty_path_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("inferDbPath must be a non-empty path")
+            }),
+            json!({
+                "case": "unknown_argument_fails_schema",
+                "expected": "schema validation failed",
+                "actual": unknown_result,
+                "pass": unknown_result["isError"] == true
+                    && unknown_result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("schema validation failed")
+            }),
+            json!({
+                "case": "malformed_component_sots_are_component_errors",
+                "expected": {
+                    "overallStatus": "degraded",
+                    "subscriberErrorCode": "MEJEPA_DAEMON_STATUS_SUBSCRIBER_READ_FAILED"
+                },
+                "actual": bad_structured,
+                "pass": bad_structured["overallStatus"] == "degraded"
+                    && bad_structured["components"]["subscriber"]["errorCode"]
+                        == "MEJEPA_DAEMON_STATUS_SUBSCRIBER_READ_FAILED"
+            }),
+        ];
+        let all_passed = happy_pass && boundary_cases.iter().all(|case| case["pass"] == true);
+        let evidence = json!({
+            "fsv_root": fsv_root,
+            "task_id": "TASK-OBS-003",
+            "started_at_unix_ms": started_at_unix_ms,
+            "build_release_sha": git_head_short_for_test(),
+            "happy_path": [{
+                "case": "daemon_status_aggregates_sources",
+                "sot": "mcp__cgreality__mejepa_daemon_status structuredContent",
+                "before": null,
+                "trigger": "cargo test -p context-graph-mcp mejepa_daemon_status_writes_phase_f_fsv_artifact",
+                "after": happy_structured,
+                "expected": "runtime/subscriber/heal/quota healthy and VRAM disabled",
+                "actual": happy_pass,
+                "pass": happy_pass,
+                "evidence_path": run_root
+            }],
+            "boundary_cases": boundary_cases,
+            "all_passed": all_passed,
+            "readback_equal": true,
+            "physical_artifacts": {
+                "run_root": run_root
+            }
+        });
+        assert!(all_passed);
+        let evidence_path = fsv_root.join("daemon_status_fsv.json");
+        context_graph_mejepa::eval::report::write_json_0600(&evidence_path, &evidence).unwrap();
+        let readback: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(readback, evidence);
+        let metadata = std::fs::metadata(&evidence_path).unwrap();
+        assert!(metadata.len() > 0);
+    }
+
+    fn git_head_short_for_test() -> String {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}

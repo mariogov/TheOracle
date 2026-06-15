@@ -1,0 +1,53 @@
+[package]
+name = "context-graph-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Storage layer for Context Graph with RocksDB backend"
+license = "PolyForm-Noncommercial-1.0.0"
+
+[dependencies]
+context-graph-core = { path = "../context-graph-core" }
+context-graph-witness = { path = "../context-graph-witness" }
+context-graph-mejepa-cf = { path = "../context-graph-mejepa-cf" }
+# GPU required per constitution (stack.gpu, AP-007)
+context-graph-embeddings = { path = "../context-graph-embeddings", features = ["candle", "cuda"] }
+# GPU batch similarity for multi-space search (ARCH-GPU-06)
+context-graph-cuda = { path = "../context-graph-cuda", optional = true }
+rocksdb = "0.22"
+bincode = "1.3"
+thiserror = "1.0"
+uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+blake3 = "1.5"
+tokio = { version = "1.35", features = ["sync", "rt-multi-thread", "macros"] }
+async-trait = "0.1"
+tracing = "0.1"
+rayon = "1.10"
+# HIGH-17/MED-11 FIX: Non-poisonable RwLock to prevent cascading panics
+parking_lot = "0.12"
+dashmap = "5.5"
+sha2 = "0.10"
+# HNSW graph traversal - replaces brute force O(n) with O(log n)
+# TASK-STORAGE-P1-001
+usearch = "2"
+
+# Unix file locking for stale lock detection
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# GPU is REQUIRED for production. Constitution Reference: stack.gpu, AP-007
+default = ["cuda"]
+cuda = ["context-graph-embeddings/cuda", "dep:context-graph-cuda", "context-graph-cuda/cuda"]
+
+[dev-dependencies]
+tempfile = "3.10"
+rand = { version = "0.8", features = ["std_rng"] }
+futures = "0.3"
+toml.workspace = true
+# Enable test-utils for stubs access in tests (AP-007 compliant)
+context-graph-core = { path = "../context-graph-core", features = ["test-utils"] }
+# Shared test utilities (C5: cross-crate deduplication)
+context-graph-test-utils = { path = "../context-graph-test-utils" }

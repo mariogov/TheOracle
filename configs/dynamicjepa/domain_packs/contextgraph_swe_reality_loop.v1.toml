@@ -1,0 +1,1518 @@
+[domain]
+id = "contextgraph_swe_reality_loop_v1"
+version = "1.0.0"
+title = "ContextGraph SWE Reality Loop - Structured Tool Transition Dynamics"
+schema_version = 1
+
+[time]
+field = { name = "ts_ms", kind = "i64", required = true, min = 0 }
+
+[[state.fields]]
+name = "counter"
+kind = { type = "i64" }
+required = true
+min = -10000
+max = 10000
+
+[[state.fields]]
+name = "attempt"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 10000
+
+[[state.fields]]
+name = "round"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 1000
+
+[[state.fields]]
+name = "tool_family"
+kind = { type = "categorical", variants = ["reality_readback", "repository_navigation", "workspace_mutation", "verification", "memory_retrieval", "deterministic_analysis", "unknown_tool_family"] }
+required = true
+
+[[state.fields]]
+name = "repo_dirty_state"
+kind = { type = "categorical", variants = ["clean", "dirty"] }
+required = true
+
+[[state.fields]]
+name = "prompt_version"
+kind = { type = "categorical", variants = ["unknown", "v1", "v2"] }
+required = true
+
+[[state.fields]]
+name = "model_id"
+kind = { type = "categorical", variants = ["qwen3_6_27b", "other"] }
+required = true
+
+[[state.fields]]
+name = "primary_path_bucket"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "docs", "migrations", "multiple", "unknown"] }
+required = true
+
+[[state.fields]]
+name = "symbol_bucket"
+kind = { type = "categorical", variants = ["none", "function", "class", "module", "config_key", "test_case", "unknown"] }
+required = true
+
+[[state.fields]]
+name = "dependency_layer"
+kind = { type = "categorical", variants = ["unknown", "cli", "api", "data_model", "storage", "test_harness", "config"] }
+required = true
+
+[[state.fields]]
+name = "test_target_kind"
+kind = { type = "categorical", variants = ["none", "unit", "integration", "official_swe", "collection", "unknown"] }
+required = true
+
+[[state.fields]]
+name = "error_signature"
+kind = { type = "categorical", variants = ["none", "assertion", "import_error", "syntax_error", "timeout", "collection", "tool_error", "unknown"] }
+required = true
+
+[[state.fields]]
+name = "ownership_bucket"
+kind = { type = "categorical", variants = ["none", "application", "tests", "build_or_config", "generated", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "delta"
+kind = { type = "i64" }
+required = true
+min = -10
+max = 10
+
+[[action.fields]]
+name = "tool_family"
+kind = { type = "categorical", variants = ["reality_readback", "repository_navigation", "workspace_mutation", "verification", "memory_retrieval", "deterministic_analysis", "unknown_tool_family"] }
+required = true
+
+[[action.fields]]
+name = "command_kind"
+kind = { type = "categorical", variants = ["read_problem_reality", "read_official_failure_reality", "list_files", "inspect_symbol", "search_repo", "open_file_window", "apply_line_window_edit", "apply_structured_edit", "apply_unified_diff", "run_targeted_test", "run_official_swe_eval", "compare_attempts", "retrieve_similar_verified_episodes", "synthesize_helper_tool", "unknown_tool"] }
+required = true
+
+[[action.fields]]
+name = "edit_size_bucket"
+kind = { type = "categorical", variants = ["none", "small", "medium", "large"] }
+required = true
+
+[[action.fields]]
+name = "path_risk"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "multiple", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "target_path_bucket"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "docs", "migrations", "multiple", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "symbol_bucket"
+kind = { type = "categorical", variants = ["none", "function", "class", "module", "config_key", "test_case", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "dependency_layer"
+kind = { type = "categorical", variants = ["unknown", "cli", "api", "data_model", "storage", "test_harness", "config"] }
+required = true
+
+[[action.fields]]
+name = "test_target_kind"
+kind = { type = "categorical", variants = ["none", "unit", "integration", "official_swe", "collection", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "ownership_bucket"
+kind = { type = "categorical", variants = ["none", "application", "tests", "build_or_config", "generated", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "planned_patch_bytes"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 1000000
+
+[[action.fields]]
+name = "planned_changed_file_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 100
+
+[[action.fields]]
+name = "patch_intent_bucket"
+kind = { type = "categorical", variants = ["none", "localized_fix", "refactor", "config_update", "test_adjustment", "multi_file", "verification_only", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "patch_shape_bucket"
+kind = { type = "categorical", variants = ["none", "line_window", "structured_replace", "unified_single_hunk", "unified_multi_hunk", "unified_multi_file", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "patch_scope_bucket"
+kind = { type = "categorical", variants = ["none", "single_symbol", "single_file", "multi_file", "cross_layer", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "ast_language"
+kind = { type = "categorical", variants = ["none", "python", "rust", "javascript", "typescript", "tsx", "go", "java", "c", "cpp", "csharp", "ruby", "php", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "ast_parse_status"
+kind = { type = "categorical", variants = ["none", "parsed", "syntax_error", "unsupported_language", "file_missing"] }
+required = true
+
+[[action.fields]]
+name = "ast_node_kind"
+kind = { type = "categorical", variants = ["none", "function", "class", "method", "module", "import", "call", "assignment", "config", "test", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "ast_symbol_kind"
+kind = { type = "categorical", variants = ["none", "function", "class", "method", "module", "test_case", "config_key", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "ast_edit_kind"
+kind = { type = "categorical", variants = ["none", "function_body", "signature", "import_section", "class_body", "module_scope", "call_site", "assignment", "test_case", "config", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "ast_touched_node_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 10000
+
+[[action.fields]]
+name = "ast_symbol_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 10000
+
+[[action.fields]]
+name = "semantic_provider"
+kind = { type = "categorical", variants = ["none", "parser_symbol_graph", "compiler_lsp", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "semantic_status"
+kind = { type = "categorical", variants = ["none", "analyzed", "syntax_error", "unsupported_language", "graph_missing", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "symbol_visibility"
+kind = { type = "categorical", variants = ["none", "private", "public", "exported", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "patch_delta_kind"
+kind = { type = "categorical", variants = ["none", "behavior_logic", "control_flow", "error_handling", "return_contract", "api_contract", "import_dependency", "data_shape", "test_assertion", "config", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "control_flow_delta"
+kind = { type = "categorical", variants = ["none", "changed", "unchanged", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "api_contract_delta"
+kind = { type = "categorical", variants = ["none", "signature_changed", "visibility_changed", "return_changed", "unchanged", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "dependency_blast_radius"
+kind = { type = "categorical", variants = ["none", "local_symbol", "single_file", "cross_file", "cross_layer", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "reverse_reference_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 10000
+
+[[action.fields]]
+name = "compiler_semantic_status"
+kind = { type = "categorical", variants = ["none", "checked", "diagnostics", "toolchain_missing", "project_missing", "unsupported_language", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "type_resolution_status"
+kind = { type = "categorical", variants = ["none", "resolved", "unresolved", "unsupported", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "import_resolution_status"
+kind = { type = "categorical", variants = ["none", "resolved", "unresolved", "unsupported", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "compiler_diagnostic_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 10000
+
+[[action.fields]]
+name = "test_attribution_status"
+kind = { type = "categorical", variants = ["none", "inferred_from_path", "inferred_from_manifest", "inferred_from_coverage", "missing", "mixed", "unknown"] }
+required = true
+
+[[action.fields]]
+name = "attributed_test_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 10000
+
+[[action.fields]]
+name = "predicted_verifier_target"
+kind = { type = "categorical", variants = ["none", "static_check", "unit", "integration", "official", "lint", "typecheck", "mixed", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "next_counter"
+kind = { type = "i64" }
+required = true
+min = -10000
+max = 10000
+
+[[outcome.fields]]
+name = "outcome_label"
+kind = { type = "categorical", variants = ["Useful", "Neutral", "Harmful", "Unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "result_status"
+kind = { type = "categorical", variants = ["ok", "failed", "blocked", "error", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "verifier_status"
+kind = { type = "categorical", variants = ["not_run", "targeted_ok", "targeted_failed", "official_ok", "official_failed", "blocked", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "test_failure_class"
+kind = { type = "categorical", variants = ["none", "assertion", "import_error", "syntax_error", "timeout", "collection", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "incident_code"
+kind = { type = "categorical", variants = ["none", "tool_error", "edit_compile_error", "policy_violation", "repeated_error_deadlock", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "changed_file_count"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 100
+
+[[outcome.fields]]
+name = "patch_bytes"
+kind = { type = "i64" }
+required = true
+min = 0
+max = 1000000
+
+[[outcome.fields]]
+name = "correction_required"
+kind = { type = "categorical", variants = ["false", "true"] }
+required = true
+
+[[outcome.fields]]
+name = "file_risk"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "multiple", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "error_signature"
+kind = { type = "categorical", variants = ["none", "assertion", "import_error", "syntax_error", "timeout", "collection", "tool_error", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "symbol_bucket"
+kind = { type = "categorical", variants = ["none", "function", "class", "module", "config_key", "test_case", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "dependency_layer"
+kind = { type = "categorical", variants = ["unknown", "cli", "api", "data_model", "storage", "test_harness", "config"] }
+required = true
+
+[[outcome.fields]]
+name = "test_target_kind"
+kind = { type = "categorical", variants = ["none", "unit", "integration", "official_swe", "collection", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "ownership_bucket"
+kind = { type = "categorical", variants = ["none", "application", "tests", "build_or_config", "generated", "unknown"] }
+required = true
+
+[[outcome.fields]]
+name = "transition_id"
+kind = { type = "string" }
+required = true
+
+[[entity.fields]]
+name = "trajectory_id"
+kind = { type = "string" }
+required = true
+
+[[entity.fields]]
+name = "run_id"
+kind = { type = "string" }
+required = true
+
+[[instruments]]
+id = "tool_progress_counter"
+kind = { type = "scalar" }
+input_fields = ["state.counter"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 32.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = -10000.0
+max = 10000.0
+
+[[instruments]]
+id = "attempt_index"
+kind = { type = "scalar" }
+input_fields = ["state.attempt"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 32.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 10000.0
+
+[[instruments]]
+id = "round_index"
+kind = { type = "scalar" }
+input_fields = ["state.round"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 16.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 1000.0
+
+[[instruments]]
+id = "state_tool_family"
+kind = { type = "categorical", variants = ["reality_readback", "repository_navigation", "workspace_mutation", "verification", "memory_retrieval", "deterministic_analysis", "unknown_tool_family"] }
+input_fields = ["state.tool_family"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "repo_dirty_state"
+kind = { type = "categorical", variants = ["clean", "dirty"] }
+input_fields = ["state.repo_dirty_state"]
+output_shape = [2]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "prompt_version"
+kind = { type = "categorical", variants = ["unknown", "v1", "v2"] }
+input_fields = ["state.prompt_version"]
+output_shape = [3]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "model_id"
+kind = { type = "categorical", variants = ["qwen3_6_27b", "other"] }
+input_fields = ["state.model_id"]
+output_shape = [2]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "state_primary_path_bucket"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "docs", "migrations", "multiple", "unknown"] }
+input_fields = ["state.primary_path_bucket"]
+output_shape = [8]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "state_symbol_bucket"
+kind = { type = "categorical", variants = ["none", "function", "class", "module", "config_key", "test_case", "unknown"] }
+input_fields = ["state.symbol_bucket"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "state_dependency_layer"
+kind = { type = "categorical", variants = ["unknown", "cli", "api", "data_model", "storage", "test_harness", "config"] }
+input_fields = ["state.dependency_layer"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "state_test_target_kind"
+kind = { type = "categorical", variants = ["none", "unit", "integration", "official_swe", "collection", "unknown"] }
+input_fields = ["state.test_target_kind"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "state_error_signature"
+kind = { type = "categorical", variants = ["none", "assertion", "import_error", "syntax_error", "timeout", "collection", "tool_error", "unknown"] }
+input_fields = ["state.error_signature"]
+output_shape = [8]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "state_ownership_bucket"
+kind = { type = "categorical", variants = ["none", "application", "tests", "build_or_config", "generated", "unknown"] }
+input_fields = ["state.ownership_bucket"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "tool_utility_delta"
+kind = { type = "scalar" }
+input_fields = ["action.delta"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 5.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = -10.0
+max = 10.0
+
+[[instruments]]
+id = "action_tool_family"
+kind = { type = "categorical", variants = ["reality_readback", "repository_navigation", "workspace_mutation", "verification", "memory_retrieval", "deterministic_analysis", "unknown_tool_family"] }
+input_fields = ["action.tool_family"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "command_kind"
+kind = { type = "categorical", variants = ["read_problem_reality", "read_official_failure_reality", "list_files", "inspect_symbol", "search_repo", "open_file_window", "apply_line_window_edit", "apply_structured_edit", "apply_unified_diff", "run_targeted_test", "run_official_swe_eval", "compare_attempts", "retrieve_similar_verified_episodes", "synthesize_helper_tool", "unknown_tool"] }
+input_fields = ["action.command_kind"]
+output_shape = [15]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "edit_size_bucket"
+kind = { type = "categorical", variants = ["none", "small", "medium", "large"] }
+input_fields = ["action.edit_size_bucket"]
+output_shape = [4]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "path_risk"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "multiple", "unknown"] }
+input_fields = ["action.path_risk"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_target_path_bucket"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "docs", "migrations", "multiple", "unknown"] }
+input_fields = ["action.target_path_bucket"]
+output_shape = [8]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_symbol_bucket"
+kind = { type = "categorical", variants = ["none", "function", "class", "module", "config_key", "test_case", "unknown"] }
+input_fields = ["action.symbol_bucket"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_dependency_layer"
+kind = { type = "categorical", variants = ["unknown", "cli", "api", "data_model", "storage", "test_harness", "config"] }
+input_fields = ["action.dependency_layer"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_test_target_kind"
+kind = { type = "categorical", variants = ["none", "unit", "integration", "official_swe", "collection", "unknown"] }
+input_fields = ["action.test_target_kind"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ownership_bucket"
+kind = { type = "categorical", variants = ["none", "application", "tests", "build_or_config", "generated", "unknown"] }
+input_fields = ["action.ownership_bucket"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "planned_patch_bytes"
+kind = { type = "scalar" }
+input_fields = ["action.planned_patch_bytes"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 2048.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 1000000.0
+
+[[instruments]]
+id = "planned_changed_file_count"
+kind = { type = "scalar" }
+input_fields = ["action.planned_changed_file_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 4.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 100.0
+
+[[instruments]]
+id = "patch_intent_bucket"
+kind = { type = "categorical", variants = ["none", "localized_fix", "refactor", "config_update", "test_adjustment", "multi_file", "verification_only", "unknown"] }
+input_fields = ["action.patch_intent_bucket"]
+output_shape = [8]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "patch_shape_bucket"
+kind = { type = "categorical", variants = ["none", "line_window", "structured_replace", "unified_single_hunk", "unified_multi_hunk", "unified_multi_file", "unknown"] }
+input_fields = ["action.patch_shape_bucket"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "patch_scope_bucket"
+kind = { type = "categorical", variants = ["none", "single_symbol", "single_file", "multi_file", "cross_layer", "unknown"] }
+input_fields = ["action.patch_scope_bucket"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ast_language"
+kind = { type = "categorical", variants = ["none", "python", "rust", "javascript", "typescript", "tsx", "go", "java", "c", "cpp", "csharp", "ruby", "php", "mixed", "unknown"] }
+input_fields = ["action.ast_language"]
+output_shape = [15]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ast_parse_status"
+kind = { type = "categorical", variants = ["none", "parsed", "syntax_error", "unsupported_language", "file_missing"] }
+input_fields = ["action.ast_parse_status"]
+output_shape = [5]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ast_node_kind"
+kind = { type = "categorical", variants = ["none", "function", "class", "method", "module", "import", "call", "assignment", "config", "test", "mixed", "unknown"] }
+input_fields = ["action.ast_node_kind"]
+output_shape = [12]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ast_symbol_kind"
+kind = { type = "categorical", variants = ["none", "function", "class", "method", "module", "test_case", "config_key", "mixed", "unknown"] }
+input_fields = ["action.ast_symbol_kind"]
+output_shape = [9]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ast_edit_kind"
+kind = { type = "categorical", variants = ["none", "function_body", "signature", "import_section", "class_body", "module_scope", "call_site", "assignment", "test_case", "config", "mixed", "unknown"] }
+input_fields = ["action.ast_edit_kind"]
+output_shape = [12]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_ast_touched_node_count"
+kind = { type = "scalar" }
+input_fields = ["action.ast_touched_node_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 1.0, std = 4.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 10000.0
+
+[[instruments]]
+id = "action_ast_symbol_count"
+kind = { type = "scalar" }
+input_fields = ["action.ast_symbol_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 1.0, std = 4.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 10000.0
+
+[[instruments]]
+id = "action_semantic_provider"
+kind = { type = "categorical", variants = ["none", "parser_symbol_graph", "compiler_lsp", "mixed", "unknown"] }
+input_fields = ["action.semantic_provider"]
+output_shape = [5]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_semantic_status"
+kind = { type = "categorical", variants = ["none", "analyzed", "syntax_error", "unsupported_language", "graph_missing", "mixed", "unknown"] }
+input_fields = ["action.semantic_status"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_symbol_visibility"
+kind = { type = "categorical", variants = ["none", "private", "public", "exported", "mixed", "unknown"] }
+input_fields = ["action.symbol_visibility"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_patch_delta_kind"
+kind = { type = "categorical", variants = ["none", "behavior_logic", "control_flow", "error_handling", "return_contract", "api_contract", "import_dependency", "data_shape", "test_assertion", "config", "mixed", "unknown"] }
+input_fields = ["action.patch_delta_kind"]
+output_shape = [12]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_control_flow_delta"
+kind = { type = "categorical", variants = ["none", "changed", "unchanged", "mixed", "unknown"] }
+input_fields = ["action.control_flow_delta"]
+output_shape = [5]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_api_contract_delta"
+kind = { type = "categorical", variants = ["none", "signature_changed", "visibility_changed", "return_changed", "unchanged", "mixed", "unknown"] }
+input_fields = ["action.api_contract_delta"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_dependency_blast_radius"
+kind = { type = "categorical", variants = ["none", "local_symbol", "single_file", "cross_file", "cross_layer", "mixed", "unknown"] }
+input_fields = ["action.dependency_blast_radius"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_reverse_reference_count"
+kind = { type = "scalar" }
+input_fields = ["action.reverse_reference_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 1.0, std = 8.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 10000.0
+
+[[instruments]]
+id = "action_compiler_semantic_status"
+kind = { type = "categorical", variants = ["none", "checked", "diagnostics", "toolchain_missing", "project_missing", "unsupported_language", "mixed", "unknown"] }
+input_fields = ["action.compiler_semantic_status"]
+output_shape = [8]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_type_resolution_status"
+kind = { type = "categorical", variants = ["none", "resolved", "unresolved", "unsupported", "mixed", "unknown"] }
+input_fields = ["action.type_resolution_status"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_import_resolution_status"
+kind = { type = "categorical", variants = ["none", "resolved", "unresolved", "unsupported", "mixed", "unknown"] }
+input_fields = ["action.import_resolution_status"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_compiler_diagnostic_count"
+kind = { type = "scalar" }
+input_fields = ["action.compiler_diagnostic_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 4.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 10000.0
+
+[[instruments]]
+id = "action_test_attribution_status"
+kind = { type = "categorical", variants = ["none", "inferred_from_path", "inferred_from_manifest", "inferred_from_coverage", "missing", "mixed", "unknown"] }
+input_fields = ["action.test_attribution_status"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "action_attributed_test_count"
+kind = { type = "scalar" }
+input_fields = ["action.attributed_test_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 1.0, std = 4.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 10000.0
+
+[[instruments]]
+id = "action_predicted_verifier_target"
+kind = { type = "categorical", variants = ["none", "static_check", "unit", "integration", "official", "lint", "typecheck", "mixed", "unknown"] }
+input_fields = ["action.predicted_verifier_target"]
+output_shape = [9]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "observed_progress_counter"
+kind = { type = "scalar" }
+input_fields = ["outcome.next_counter"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 32.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = -10000.0
+max = 10000.0
+
+[[instruments]]
+id = "outcome_label"
+kind = { type = "categorical", variants = ["Useful", "Neutral", "Harmful", "Unknown"] }
+input_fields = ["outcome.outcome_label"]
+output_shape = [4]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "result_status"
+kind = { type = "categorical", variants = ["ok", "failed", "blocked", "error", "unknown"] }
+input_fields = ["outcome.result_status"]
+output_shape = [5]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "verifier_status"
+kind = { type = "categorical", variants = ["not_run", "targeted_ok", "targeted_failed", "official_ok", "official_failed", "blocked", "unknown"] }
+input_fields = ["outcome.verifier_status"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "test_failure_class"
+kind = { type = "categorical", variants = ["none", "assertion", "import_error", "syntax_error", "timeout", "collection", "unknown"] }
+input_fields = ["outcome.test_failure_class"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "incident_code"
+kind = { type = "categorical", variants = ["none", "tool_error", "edit_compile_error", "policy_violation", "repeated_error_deadlock", "unknown"] }
+input_fields = ["outcome.incident_code"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "changed_file_count"
+kind = { type = "scalar" }
+input_fields = ["outcome.changed_file_count"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 4.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 100.0
+
+[[instruments]]
+id = "patch_bytes"
+kind = { type = "scalar" }
+input_fields = ["outcome.patch_bytes"]
+output_shape = [1]
+normalization = { type = "standard_score", mean = 0.0, std = 2048.0 }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+max = 1000000.0
+
+[[instruments]]
+id = "correction_required"
+kind = { type = "categorical", variants = ["false", "true"] }
+input_fields = ["outcome.correction_required"]
+output_shape = [2]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "outcome_file_risk"
+kind = { type = "categorical", variants = ["none", "source", "tests", "config_or_build", "multiple", "unknown"] }
+input_fields = ["outcome.file_risk"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "outcome_error_signature"
+kind = { type = "categorical", variants = ["none", "assertion", "import_error", "syntax_error", "timeout", "collection", "tool_error", "unknown"] }
+input_fields = ["outcome.error_signature"]
+output_shape = [8]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "outcome_symbol_bucket"
+kind = { type = "categorical", variants = ["none", "function", "class", "module", "config_key", "test_case", "unknown"] }
+input_fields = ["outcome.symbol_bucket"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "outcome_dependency_layer"
+kind = { type = "categorical", variants = ["unknown", "cli", "api", "data_model", "storage", "test_harness", "config"] }
+input_fields = ["outcome.dependency_layer"]
+output_shape = [7]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "outcome_test_target_kind"
+kind = { type = "categorical", variants = ["none", "unit", "integration", "official_swe", "collection", "unknown"] }
+input_fields = ["outcome.test_target_kind"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "outcome_ownership_bucket"
+kind = { type = "categorical", variants = ["none", "application", "tests", "build_or_config", "generated", "unknown"] }
+input_fields = ["outcome.ownership_bucket"]
+output_shape = [6]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+
+[[instruments]]
+id = "transition_time"
+kind = { type = "time", encoding = "fractional_day_of_week" }
+input_fields = ["time.ts_ms"]
+output_shape = [1]
+normalization = { type = "none" }
+required = true
+pair_kinds = ["cosine"]
+version = 1
+[instruments.validation]
+require_finite = true
+reject_nan = true
+reject_inf = true
+min = 0.0
+
+[[adapters]]
+id = "json_event"
+kind = "json_event"
+version = 1
+[adapters.mapping]
+"state.counter" = "$.state.counter"
+"state.attempt" = "$.state.attempt"
+"state.round" = "$.state.round"
+"state.tool_family" = "$.state.tool_family"
+"state.repo_dirty_state" = "$.state.repo_dirty_state"
+"state.prompt_version" = "$.state.prompt_version"
+"state.model_id" = "$.state.model_id"
+"state.primary_path_bucket" = "$.state.primary_path_bucket"
+"state.symbol_bucket" = "$.state.symbol_bucket"
+"state.dependency_layer" = "$.state.dependency_layer"
+"state.test_target_kind" = "$.state.test_target_kind"
+"state.error_signature" = "$.state.error_signature"
+"state.ownership_bucket" = "$.state.ownership_bucket"
+"action.delta" = "$.action.delta"
+"action.tool_family" = "$.action.tool_family"
+"action.command_kind" = "$.action.command_kind"
+"action.edit_size_bucket" = "$.action.edit_size_bucket"
+"action.path_risk" = "$.action.path_risk"
+"action.target_path_bucket" = "$.action.target_path_bucket"
+"action.symbol_bucket" = "$.action.symbol_bucket"
+"action.dependency_layer" = "$.action.dependency_layer"
+"action.test_target_kind" = "$.action.test_target_kind"
+"action.ownership_bucket" = "$.action.ownership_bucket"
+"action.planned_patch_bytes" = "$.action.planned_patch_bytes"
+"action.planned_changed_file_count" = "$.action.planned_changed_file_count"
+"action.patch_intent_bucket" = "$.action.patch_intent_bucket"
+"action.patch_shape_bucket" = "$.action.patch_shape_bucket"
+"action.patch_scope_bucket" = "$.action.patch_scope_bucket"
+"action.ast_language" = "$.action.ast_language"
+"action.ast_parse_status" = "$.action.ast_parse_status"
+"action.ast_node_kind" = "$.action.ast_node_kind"
+"action.ast_symbol_kind" = "$.action.ast_symbol_kind"
+"action.ast_edit_kind" = "$.action.ast_edit_kind"
+"action.ast_touched_node_count" = "$.action.ast_touched_node_count"
+"action.ast_symbol_count" = "$.action.ast_symbol_count"
+"action.semantic_provider" = "$.action.semantic_provider"
+"action.semantic_status" = "$.action.semantic_status"
+"action.symbol_visibility" = "$.action.symbol_visibility"
+"action.patch_delta_kind" = "$.action.patch_delta_kind"
+"action.control_flow_delta" = "$.action.control_flow_delta"
+"action.api_contract_delta" = "$.action.api_contract_delta"
+"action.dependency_blast_radius" = "$.action.dependency_blast_radius"
+"action.reverse_reference_count" = "$.action.reverse_reference_count"
+"action.compiler_semantic_status" = "$.action.compiler_semantic_status"
+"action.type_resolution_status" = "$.action.type_resolution_status"
+"action.import_resolution_status" = "$.action.import_resolution_status"
+"action.compiler_diagnostic_count" = "$.action.compiler_diagnostic_count"
+"action.test_attribution_status" = "$.action.test_attribution_status"
+"action.attributed_test_count" = "$.action.attributed_test_count"
+"action.predicted_verifier_target" = "$.action.predicted_verifier_target"
+"outcome.next_counter" = "$.outcome.next_counter"
+"outcome.outcome_label" = "$.outcome.outcome_label"
+"outcome.result_status" = "$.outcome.result_status"
+"outcome.verifier_status" = "$.outcome.verifier_status"
+"outcome.test_failure_class" = "$.outcome.test_failure_class"
+"outcome.incident_code" = "$.outcome.incident_code"
+"outcome.changed_file_count" = "$.outcome.changed_file_count"
+"outcome.patch_bytes" = "$.outcome.patch_bytes"
+"outcome.correction_required" = "$.outcome.correction_required"
+"outcome.file_risk" = "$.outcome.file_risk"
+"outcome.error_signature" = "$.outcome.error_signature"
+"outcome.symbol_bucket" = "$.outcome.symbol_bucket"
+"outcome.dependency_layer" = "$.outcome.dependency_layer"
+"outcome.test_target_kind" = "$.outcome.test_target_kind"
+"outcome.ownership_bucket" = "$.outcome.ownership_bucket"
+"outcome.transition_id" = "$.transition_id"
+"time.ts_ms" = "$.ts_ms"
+"entity.trajectory_id" = "$.trajectory_id"
+"entity.run_id" = "$.run_id"
+
+[[objectives]]
+id = "predict_next_tool_progress"
+kind = "latent_delta"
+input_panel = "state_action"
+target = "outcome.next_counter"
+loss_weight = 1.0
+required_dataset_fields = ["target_panel_id", "input_panel_id", "action_id"]
+
+[[invariants]]
+id = "tool_progress_conservation"
+expression = "outcome.next_counter == state.counter + action.delta"
+severity = "fatal"
+
+[dataset_policy]
+default_split = "by_time"
+default_objective = "predict_next_tool_progress"
+negative_sampling = "same_domain_different_outcome"
+min_negatives_per_row = 1
+
+[planner_policy]
+candidate_actions = { kind = "enumerated", records = [
+  { delta = -4, tool_family = "workspace_mutation", command_kind = "apply_unified_diff", edit_size_bucket = "large", path_risk = "multiple", target_path_bucket = "multiple", symbol_bucket = "module", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 32768, planned_changed_file_count = 2, patch_intent_bucket = "multi_file", patch_shape_bucket = "unified_multi_file", patch_scope_bucket = "cross_layer", ast_language = "mixed", ast_parse_status = "parsed", ast_node_kind = "mixed", ast_symbol_kind = "mixed", ast_edit_kind = "mixed", ast_touched_node_count = 2, ast_symbol_count = 2, semantic_provider = "mixed", semantic_status = "analyzed", symbol_visibility = "mixed", patch_delta_kind = "mixed", control_flow_delta = "mixed", api_contract_delta = "mixed", dependency_blast_radius = "cross_layer", reverse_reference_count = 8, compiler_semantic_status = "checked", type_resolution_status = "resolved", import_resolution_status = "resolved", compiler_diagnostic_count = 0, test_attribution_status = "inferred_from_manifest", attributed_test_count = 1, predicted_verifier_target = "typecheck" },
+  { delta = -2, tool_family = "verification", command_kind = "run_targeted_test", edit_size_bucket = "none", path_risk = "none", target_path_bucket = "tests", symbol_bucket = "test_case", dependency_layer = "test_harness", test_target_kind = "unit", ownership_bucket = "tests", planned_patch_bytes = 0, planned_changed_file_count = 0, patch_intent_bucket = "verification_only", patch_shape_bucket = "none", patch_scope_bucket = "none", ast_language = "none", ast_parse_status = "none", ast_node_kind = "none", ast_symbol_kind = "none", ast_edit_kind = "none", ast_touched_node_count = 0, ast_symbol_count = 0, semantic_provider = "none", semantic_status = "none", symbol_visibility = "none", patch_delta_kind = "none", control_flow_delta = "none", api_contract_delta = "none", dependency_blast_radius = "none", reverse_reference_count = 0, compiler_semantic_status = "none", type_resolution_status = "none", import_resolution_status = "none", compiler_diagnostic_count = 0, test_attribution_status = "none", attributed_test_count = 0, predicted_verifier_target = "unit" },
+  { delta = 0, tool_family = "repository_navigation", command_kind = "list_files", edit_size_bucket = "none", path_risk = "source", target_path_bucket = "source", symbol_bucket = "module", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 0, planned_changed_file_count = 0, patch_intent_bucket = "none", patch_shape_bucket = "none", patch_scope_bucket = "none", ast_language = "none", ast_parse_status = "none", ast_node_kind = "none", ast_symbol_kind = "none", ast_edit_kind = "none", ast_touched_node_count = 0, ast_symbol_count = 0, semantic_provider = "none", semantic_status = "none", symbol_visibility = "none", patch_delta_kind = "none", control_flow_delta = "none", api_contract_delta = "none", dependency_blast_radius = "none", reverse_reference_count = 0, compiler_semantic_status = "none", type_resolution_status = "none", import_resolution_status = "none", compiler_diagnostic_count = 0, test_attribution_status = "none", attributed_test_count = 0, predicted_verifier_target = "none" },
+  { delta = 2, tool_family = "repository_navigation", command_kind = "search_repo", edit_size_bucket = "none", path_risk = "source", target_path_bucket = "source", symbol_bucket = "function", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 0, planned_changed_file_count = 0, patch_intent_bucket = "none", patch_shape_bucket = "none", patch_scope_bucket = "none", ast_language = "none", ast_parse_status = "none", ast_node_kind = "none", ast_symbol_kind = "none", ast_edit_kind = "none", ast_touched_node_count = 0, ast_symbol_count = 0, semantic_provider = "none", semantic_status = "none", symbol_visibility = "none", patch_delta_kind = "none", control_flow_delta = "none", api_contract_delta = "none", dependency_blast_radius = "none", reverse_reference_count = 0, compiler_semantic_status = "none", type_resolution_status = "none", import_resolution_status = "none", compiler_diagnostic_count = 0, test_attribution_status = "none", attributed_test_count = 0, predicted_verifier_target = "none" },
+  { delta = 4, tool_family = "repository_navigation", command_kind = "open_file_window", edit_size_bucket = "none", path_risk = "source", target_path_bucket = "source", symbol_bucket = "module", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 0, planned_changed_file_count = 0, patch_intent_bucket = "none", patch_shape_bucket = "none", patch_scope_bucket = "none", ast_language = "none", ast_parse_status = "none", ast_node_kind = "none", ast_symbol_kind = "none", ast_edit_kind = "none", ast_touched_node_count = 0, ast_symbol_count = 0, semantic_provider = "none", semantic_status = "none", symbol_visibility = "none", patch_delta_kind = "none", control_flow_delta = "none", api_contract_delta = "none", dependency_blast_radius = "none", reverse_reference_count = 0, compiler_semantic_status = "none", type_resolution_status = "none", import_resolution_status = "none", compiler_diagnostic_count = 0, test_attribution_status = "none", attributed_test_count = 0, predicted_verifier_target = "none" },
+  { delta = 6, tool_family = "workspace_mutation", command_kind = "apply_structured_edit", edit_size_bucket = "small", path_risk = "source", target_path_bucket = "source", symbol_bucket = "function", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 512, planned_changed_file_count = 1, patch_intent_bucket = "localized_fix", patch_shape_bucket = "structured_replace", patch_scope_bucket = "single_symbol", ast_language = "python", ast_parse_status = "parsed", ast_node_kind = "function", ast_symbol_kind = "function", ast_edit_kind = "function_body", ast_touched_node_count = 1, ast_symbol_count = 1, semantic_provider = "compiler_lsp", semantic_status = "analyzed", symbol_visibility = "public", patch_delta_kind = "return_contract", control_flow_delta = "unchanged", api_contract_delta = "return_changed", dependency_blast_radius = "local_symbol", reverse_reference_count = 1, compiler_semantic_status = "checked", type_resolution_status = "unsupported", import_resolution_status = "unsupported", compiler_diagnostic_count = 0, test_attribution_status = "inferred_from_manifest", attributed_test_count = 1, predicted_verifier_target = "static_check" },
+  { delta = 7, tool_family = "workspace_mutation", command_kind = "apply_line_window_edit", edit_size_bucket = "small", path_risk = "source", target_path_bucket = "source", symbol_bucket = "function", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 512, planned_changed_file_count = 1, patch_intent_bucket = "localized_fix", patch_shape_bucket = "line_window", patch_scope_bucket = "single_symbol", ast_language = "python", ast_parse_status = "parsed", ast_node_kind = "function", ast_symbol_kind = "function", ast_edit_kind = "function_body", ast_touched_node_count = 1, ast_symbol_count = 1, semantic_provider = "compiler_lsp", semantic_status = "analyzed", symbol_visibility = "public", patch_delta_kind = "return_contract", control_flow_delta = "unchanged", api_contract_delta = "return_changed", dependency_blast_radius = "local_symbol", reverse_reference_count = 1, compiler_semantic_status = "checked", type_resolution_status = "unsupported", import_resolution_status = "unsupported", compiler_diagnostic_count = 0, test_attribution_status = "inferred_from_manifest", attributed_test_count = 1, predicted_verifier_target = "static_check" },
+  { delta = 5, tool_family = "workspace_mutation", command_kind = "apply_unified_diff", edit_size_bucket = "medium", path_risk = "source", target_path_bucket = "source", symbol_bucket = "module", dependency_layer = "unknown", test_target_kind = "none", ownership_bucket = "application", planned_patch_bytes = 4096, planned_changed_file_count = 1, patch_intent_bucket = "localized_fix", patch_shape_bucket = "unified_single_hunk", patch_scope_bucket = "single_file", ast_language = "python", ast_parse_status = "parsed", ast_node_kind = "module", ast_symbol_kind = "module", ast_edit_kind = "module_scope", ast_touched_node_count = 1, ast_symbol_count = 1, semantic_provider = "compiler_lsp", semantic_status = "analyzed", symbol_visibility = "none", patch_delta_kind = "behavior_logic", control_flow_delta = "unchanged", api_contract_delta = "unchanged", dependency_blast_radius = "single_file", reverse_reference_count = 0, compiler_semantic_status = "checked", type_resolution_status = "unsupported", import_resolution_status = "unsupported", compiler_diagnostic_count = 0, test_attribution_status = "inferred_from_manifest", attributed_test_count = 1, predicted_verifier_target = "static_check" }
+] }
+guards = ["bounds_check"]
+surprise_threshold = 0.85
+
+[constellation.global]
+modalities = [
+  "state_tool_family",
+  "repo_dirty_state",
+  "prompt_version",
+  "model_id",
+  "state_primary_path_bucket",
+  "state_symbol_bucket",
+  "state_dependency_layer",
+  "state_test_target_kind",
+  "state_error_signature",
+  "state_ownership_bucket",
+  "action_tool_family",
+  "command_kind",
+  "edit_size_bucket",
+  "path_risk",
+  "action_target_path_bucket",
+  "action_symbol_bucket",
+  "action_dependency_layer",
+  "action_test_target_kind",
+  "action_ownership_bucket",
+  "patch_intent_bucket",
+  "patch_shape_bucket",
+  "patch_scope_bucket",
+  "action_ast_language",
+  "action_ast_parse_status",
+  "action_ast_node_kind",
+  "action_ast_symbol_kind",
+  "action_ast_edit_kind",
+  "action_semantic_provider",
+  "action_semantic_status",
+  "action_symbol_visibility",
+  "action_patch_delta_kind",
+  "action_control_flow_delta",
+  "action_api_contract_delta",
+  "action_dependency_blast_radius",
+  "action_compiler_semantic_status",
+  "action_type_resolution_status",
+  "action_import_resolution_status",
+  "action_test_attribution_status",
+  "action_predicted_verifier_target",
+  "outcome_label",
+  "result_status",
+  "verifier_status",
+  "test_failure_class",
+  "incident_code",
+  "correction_required",
+  "outcome_file_risk",
+  "outcome_error_signature",
+  "outcome_symbol_bucket",
+  "outcome_dependency_layer",
+  "outcome_test_target_kind",
+  "outcome_ownership_bucket"
+]
+require_loo_min = 0.70
+calibration_percentile = 10
+calibration_set_size = 12
+
+[verification_policy]
+required_cfs = [
+  "dj_domain_packs", "dj_raw_events", "dj_adapter_runs",
+  "dj_normalized_states", "dj_actions", "dj_outcomes", "dj_transitions",
+  "dj_instrument_readings", "dj_pairwise_readings", "dj_latent_panels",
+  "dj_trajectories", "dj_dataset_shards",
+  "dj_training_runs", "dj_model_artifacts",
+  "dj_constellations", "dj_threshold_calibrations",
+  "dj_predictions", "dj_plan_traces", "dj_guard_decisions",
+  "dj_surprise_events", "dj_verification_runs", "dj_audit_log",
+  "dj_audit_witness_chain"
+]
+expected_trajectory_count = 1
+expected_event_count = 60
+expected_panel_count = 60
+expected_dataset_row_count = 59
+expected_train_rows_min = 41
+expected_train_rows_max = 41
+expected_val_rows_min = 12
+expected_val_rows_max = 12
+expected_test_rows_min = 6
+expected_test_rows_max = 6

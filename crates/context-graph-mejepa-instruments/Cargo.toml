@@ -1,0 +1,27 @@
+[package]
+name = "context-graph-mejepa-instruments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Clean-room ME-JEPA-Code Phase 1 instruments + 5,120-d panel scaffolding for ContextGraph"
+license.workspace = true
+
+[dependencies]
+context-graph-core = { path = "../context-graph-core" }
+context-graph-mejepa-cf = { path = "../context-graph-mejepa-cf" }
+context-graph-mejepa-embedders = { path = "../context-graph-mejepa-embedders" }
+context-graph-witness = { path = "../context-graph-witness" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = { workspace = true }
+toml = { workspace = true }
+rocksdb = "0.22"
+ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15.8" }
+ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.15.8" }
+ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15.8" }
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { workspace = true }

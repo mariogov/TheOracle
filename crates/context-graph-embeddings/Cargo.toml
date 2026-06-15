@@ -1,0 +1,93 @@
+[package]
+name = "context-graph-embeddings"
+version = "0.1.0"
+edition = "2021"
+authors = ["Context Graph Team"]
+description = "Embedding pipeline for Context Graph with local model support"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/contextgraph/contextgraph"
+keywords = ["embeddings", "ml", "nlp", "context-graph"]
+
+[dependencies]
+context-graph-core = { path = "../context-graph-core" }
+context-graph-cuda = { path = "../context-graph-cuda" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = "0.3"
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Error handling
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# For stub implementations and Gaussian noise in gating network
+rand = "0.8"
+rand_distr = "0.4"
+
+# UUID for request tracking
+uuid = { version = "1.0", features = ["v4"] }
+
+# Configuration
+toml = "0.8"
+
+# Hashing for content deduplication
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Time handling for temporal embeddings
+chrono = { version = "0.4", features = ["serde"] }
+
+# Zero-copy binary serialization for GDS-compatible storage
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Efficient bit vector operations for HDC (Hyperdimensional Computing) model
+bitvec = "1.0"
+
+# High-performance concurrent cache for embeddings (moka)
+moka = { version = "0.12", features = ["sync"] }
+
+# Fast binary serialization for cache persistence
+bincode = "1.3"
+
+# GPU/ML - Candle framework (HuggingFace) for RTX 5090 acceleration
+# https://github.com/huggingface/candle
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+
+# HuggingFace tokenizers for BERT-based models
+# Version 0.22+ required for modern tokenizer.json format compatibility
+tokenizers = { version = "0.22", optional = true }
+
+# SafeTensors for loading pre-trained weights (AP-007 compliant - no stub data)
+safetensors = "0.4"
+
+# SHA256 for weight file integrity verification
+sha2 = "0.10"
+
+# Hex encoding for checksum display (TASK-EMB-013)
+hex = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.10"
+serial_test = "3.0"
+# Enable test-utils for stubs access in tests (AP-007 compliant)
+context-graph-core = { path = "../context-graph-core", features = ["test-utils"] }
+
+[[bin]]
+name = "train-causal"
+path = "src/bin/train_causal.rs"
+
+[features]
+# GPU-first architecture: candle feature is MANDATORY for RTX 5090 acceleration
+# The compile_error! in lib.rs enforces this at compile time
+default = ["candle"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:tracing-subscriber"]  # Candle ML framework with CUDA 13.x (REQUIRED)
+cuda = ["candle"]   # Alias for candle - Full CUDA acceleration via Candle (RTX 5090)

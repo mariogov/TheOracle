@@ -1,0 +1,620 @@
+//! SparseModel struct and core implementation.
+//!
+//! This module contains the main SparseModel struct and its core methods
+//! including construction, loading, unloading, and embedding.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use tokenizers::Tokenizer;
+
+use crate::error::{EmbeddingError, EmbeddingResult};
+use crate::gpu::{init_gpu, GpuModelLoader};
+use crate::traits::SingleModelConfig;
+use crate::types::{InputType, ModelEmbedding, ModelId, ModelInput};
+
+use super::forward::{extract_text, gpu_forward_sparse, gpu_forward_sparse_batch};
+use super::loader::load_mlm_head;
+use super::types::{ModelState, SparseVector};
+
+/// Sparse embedding model using naver/splade-cocondenser-ensembledistil.
+///
+/// This model produces high-dimensional sparse vectors (30522D) optimized for
+/// lexical-aware semantic search. Uses BERT backbone with MLM head.
+///
+/// # Architecture
+///
+/// SPLADE learns sparse representations where each dimension corresponds to
+/// a vocabulary term. Non-zero entries indicate important terms for retrieval.
+///
+/// The output can be converted to dense format (1536D) for multi-array storage compatibility.
+///
+/// # Construction
+///
+/// ```rust,no_run
+/// use context_graph_embeddings::models::SparseModel;
+/// use context_graph_embeddings::traits::SingleModelConfig;
+/// use context_graph_embeddings::error::EmbeddingResult;
+/// use std::path::Path;
+///
+/// async fn example() -> EmbeddingResult<()> {
+///     let model = SparseModel::new(
+///         Path::new("models/sparse"),
+///         SingleModelConfig::default(),
+///     )?;
+///     model.load().await?;  // Must load before embed
+///     Ok(())
+/// }
+/// ```
+pub struct SparseModel {
+    /// Model weights and inference engine.
+    #[allow(dead_code)]
+    pub(crate) model_state: std::sync::RwLock<ModelState>,
+
+    /// Path to model weights directory.
+    #[allow(dead_code)]
+    pub(crate) model_path: PathBuf,
+
+    /// Configuration for this model instance.
+    #[allow(dead_code)]
+    pub(crate) config: SingleModelConfig,
+
+    /// Whether model weights are loaded and ready.
+    pub(crate) loaded: AtomicBool,
+
+    /// Model ID (Sparse for E6, Splade for E13).
+    /// Both use the same SPLADE architecture but report different IDs.
+    pub(crate) model_id: ModelId,
+}
+
+impl SparseModel {
+    /// Create a new SparseModel instance.
+    ///
+    /// Model is NOT loaded after construction. Call `load()` before `embed()`.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to directory containing model weights
+    /// * `config` - Device placement and quantization settings
+    ///
+    /// # Errors
+    /// - `EmbeddingError::ConfigError` if config validation fails
+    pub fn new(model_path: &Path, config: SingleModelConfig) -> EmbeddingResult<Self> {
+        Self::with_model_id(model_path, config, ModelId::Sparse)
+    }
+
+    /// Create a new SparseModel instance for the Splade model (E13).
+    ///
+    /// This creates a model with the same architecture as `new()` but reports
+    /// `ModelId::Splade` instead of `ModelId::Sparse`.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to directory containing model weights
+    /// * `config` - Device placement and quantization settings
+    ///
+    /// # Errors
+    /// - `EmbeddingError::ConfigError` if config validation fails
+    pub fn new_splade(model_path: &Path, config: SingleModelConfig) -> EmbeddingResult<Self> {
+        Self::with_model_id(model_path, config, ModelId::Splade)
+    }
+
+    /// Create a SparseModel with a specific model ID.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to directory containing model weights
+    /// * `config` - Device placement and quantization settings
+    /// * `model_id` - The ModelId to report (Sparse or Splade)
+    ///
+    /// # Errors
+    /// - `EmbeddingError::ConfigError` if config validation fails
+    fn with_model_id(
+        model_path: &Path,
+        config: SingleModelConfig,
+        model_id: ModelId,
+    ) -> EmbeddingResult<Self> {
+        if config.max_batch_size == 0 {
+            return Err(EmbeddingError::ConfigError {
+                message: "max_batch_size cannot be zero".to_string(),
+            });
+        }
+
+        Ok(Self {
+            model_state: std::sync::RwLock::new(ModelState::Unloaded),
+            model_path: model_path.to_path_buf(),
+            config,
+            loaded: AtomicBool::new(false),
+            model_id,
+        })
+    }
+
+    /// Load model weights into memory.
+    ///
+    /// # GPU Pipeline
+    ///
+    /// 1. Initialize CUDA device
+    /// 2. Load config.json, tokenizer.json, and model.safetensors
+    /// 3. Load BERT backbone weights
+    /// 4. Load MLM head weights for vocabulary projection
+    /// 5. Transfer all weight tensors to GPU VRAM
+    pub async fn load(&self) -> EmbeddingResult<()> {
+        // Initialize GPU device
+        let device = init_gpu().map_err(|e| EmbeddingError::GpuError {
+            message: format!("SparseModel GPU init failed: {}", e),
+        })?;
+
+        // Load tokenizer from model directory
+        let tokenizer_path = self.model_path.join("tokenizer.json");
+        let mut tokenizer =
+            Tokenizer::from_file(&tokenizer_path).map_err(|e| EmbeddingError::ModelLoadError {
+                model_id: ModelId::Sparse,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Tokenizer load failed at {}: {}",
+                        tokenizer_path.display(),
+                        e
+                    ),
+                )),
+            })?;
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| EmbeddingError::ModelLoadError {
+                model_id: self.model_id,
+                source: Box::new(std::io::Error::other(format!(
+                    "SparseModel disable tokenizer truncation failed: {e}"
+                ))),
+            })?;
+
+        // Load BERT backbone weights from safetensors
+        let loader = GpuModelLoader::new().map_err(|e| EmbeddingError::GpuError {
+            message: format!("SparseModel loader init failed: {}", e),
+        })?;
+
+        // SPLADE uses "bert." prefix for all weights
+        let weights = loader
+            .load_bert_weights_with_prefix(&self.model_path, "bert.")
+            .map_err(|e| EmbeddingError::ModelLoadError {
+                model_id: ModelId::Sparse,
+                source: Box::new(std::io::Error::other(format!(
+                    "SparseModel BERT weight load failed: {}",
+                    e
+                ))),
+            })?;
+
+        // Load MLM head weights
+        let safetensors_path = self.model_path.join("model.safetensors");
+        let mlm_head = load_mlm_head(&safetensors_path, device, &weights.config)?;
+
+        // Load projection matrix (REQUIRED - no fallback)
+        let projection =
+            super::projection::ProjectionMatrix::load(&self.model_path).map_err(|e| {
+                EmbeddingError::ModelLoadError {
+                    model_id: self.model_id,
+                    source: Box::new(std::io::Error::other(format!(
+                        "ProjectionMatrix load failed: {}",
+                        e
+                    ))),
+                }
+            })?;
+
+        tracing::info!(
+            "ProjectionMatrix loaded: shape [{}, {}], checksum {:02x}{:02x}{:02x}{:02x}...",
+            super::types::SPARSE_VOCAB_SIZE,
+            super::types::SPARSE_PROJECTED_DIMENSION,
+            projection.checksum()[0],
+            projection.checksum()[1],
+            projection.checksum()[2],
+            projection.checksum()[3]
+        );
+
+        tracing::info!(
+            "SparseModel loaded: {} BERT params + MLM head, hidden_size={}",
+            weights.param_count(),
+            weights.config.hidden_size
+        );
+
+        // Update state
+        let mut state = self
+            .model_state
+            .write()
+            .map_err(|e| EmbeddingError::InternalError {
+                message: format!("Failed to acquire write lock: {}", e),
+            })?;
+
+        *state = ModelState::Loaded {
+            weights: Box::new(weights),
+            tokenizer: Box::new(tokenizer),
+            mlm_head,
+            projection: Box::new(projection),
+        };
+        self.loaded.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Unload model weights from memory.
+    pub async fn unload(&self) -> EmbeddingResult<()> {
+        if !self.is_initialized() {
+            return Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id(),
+            });
+        }
+
+        let mut state = self
+            .model_state
+            .write()
+            .map_err(|e| EmbeddingError::InternalError {
+                message: format!("Failed to acquire write lock: {}", e),
+            })?;
+
+        *state = ModelState::Unloaded;
+        self.loaded.store(false, Ordering::SeqCst);
+        tracing::info!("SparseModel unloaded");
+        Ok(())
+    }
+
+    /// True CUDA batch processing using one padded SPLADE tensor forward pass.
+    pub async fn embed_batch(&self, inputs: &[ModelInput]) -> EmbeddingResult<Vec<ModelEmbedding>> {
+        let dual = self.embed_dual_batch(inputs).await?;
+        Ok(dual.into_iter().map(|embedding| embedding.dense).collect())
+    }
+
+    /// Embed text to sparse vector format.
+    ///
+    /// Returns full sparse representation with term indices and weights.
+    #[allow(dead_code)]
+    pub async fn embed_sparse(&self, input: &ModelInput) -> EmbeddingResult<SparseVector> {
+        if !self.is_initialized() {
+            return Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id(),
+            });
+        }
+
+        self.validate_input(input)?;
+        let text = extract_text(input)?;
+
+        let state = self
+            .model_state
+            .read()
+            .map_err(|e| EmbeddingError::InternalError {
+                message: format!("SparseModel failed to acquire read lock: {}", e),
+            })?;
+
+        match &*state {
+            ModelState::Loaded {
+                weights,
+                tokenizer,
+                mlm_head,
+                projection: _, // Not used for sparse output
+            } => gpu_forward_sparse(&text, weights, tokenizer, mlm_head),
+            _ => Err(EmbeddingError::NotInitialized {
+                model_id: ModelId::Sparse,
+            }),
+        }
+    }
+
+    /// Embed input to dense 1536D vector (for multi-array storage compatibility).
+    /// Per Constitution E6_Sparse: "~30K 5%active" projects to 1536D.
+    ///
+    /// # Pipeline
+    /// 1. Validate input is text type
+    /// 2. Extract text and tokenize
+    /// 3. Forward through BERT + MLM head -> SparseVector (30522D)
+    /// 4. Project sparse -> dense via learned ProjectionMatrix (1536D)
+    /// 5. Return L2-normalized embedding
+    ///
+    /// # Errors
+    /// - `NotInitialized` - Model not loaded
+    /// - `UnsupportedModality` - Input is not text
+    /// - `GpuError` - GPU operation failed (NO CPU fallback - AP-007)
+    pub async fn embed(&self, input: &ModelInput) -> EmbeddingResult<ModelEmbedding> {
+        if !self.is_initialized() {
+            return Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id(),
+            });
+        }
+
+        self.validate_input(input)?;
+        let text = extract_text(input)?;
+
+        let state = self
+            .model_state
+            .read()
+            .map_err(|e| EmbeddingError::InternalError {
+                message: format!("SparseModel failed to acquire read lock: {}", e),
+            })?;
+
+        match &*state {
+            ModelState::Loaded {
+                weights,
+                tokenizer,
+                mlm_head,
+                projection,
+            } => {
+                let start = Instant::now();
+
+                // Step 1: Forward through BERT + MLM head to get sparse vector
+                let sparse_vector = gpu_forward_sparse(&text, weights, tokenizer, mlm_head)?;
+
+                tracing::debug!(
+                    "Sparse vector: {} non-zero elements, sparsity={:.2}%",
+                    sparse_vector.nnz(),
+                    sparse_vector.sparsity() * 100.0
+                );
+
+                // Step 2: Project sparse (30522D) -> dense (1536D) using learned matrix
+                // CRITICAL: No hash fallback (AP-007). Uses real GPU matmul.
+                let dense_vector =
+                    projection
+                        .project(&sparse_vector)
+                        .map_err(|e| EmbeddingError::GpuError {
+                            message: format!("Sparse projection failed: {}", e),
+                        })?;
+
+                let latency_us = start.elapsed().as_micros() as u64;
+
+                tracing::debug!(
+                    "Projected to {}D dense vector in {}us",
+                    dense_vector.len(),
+                    latency_us
+                );
+
+                // Step 3: Return as ModelEmbedding
+                Ok(ModelEmbedding {
+                    model_id: self.model_id,
+                    vector: dense_vector,
+                    latency_us,
+                    attention_weights: None,
+                    is_projected: true, // Mark as projected from sparse
+                })
+            }
+            _ => Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id,
+            }),
+        }
+    }
+
+    /// Validate input is text type.
+    pub(crate) fn validate_input(&self, input: &ModelInput) -> EmbeddingResult<()> {
+        match input {
+            ModelInput::Text { .. } => Ok(()),
+            _ => Err(EmbeddingError::UnsupportedModality {
+                model_id: self.model_id,
+                input_type: InputType::from(input),
+            }),
+        }
+    }
+
+    /// Check if model is initialized.
+    pub fn is_initialized(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
+    }
+
+    /// Get model ID.
+    pub fn model_id(&self) -> ModelId {
+        self.model_id
+    }
+
+    /// Embed input and return BOTH sparse and dense vectors.
+    ///
+    /// This method supports the E6 upgrade proposal (docs/e6upgrade.md) by returning:
+    /// 1. The original sparse vector for Stage 1 inverted index recall
+    /// 2. The projected dense vector for Stage 3 multi-space fusion
+    ///
+    /// # Pipeline
+    /// 1. Forward through BERT + MLM head -> SparseVector (30522D)
+    /// 2. Project sparse -> dense via learned ProjectionMatrix (1536D)
+    /// 3. Return both vectors for dual storage in TeleologicalFingerprint
+    ///
+    /// # Returns
+    /// `DualEmbedding` containing both sparse and dense representations
+    ///
+    /// # Errors
+    /// - `NotInitialized` - Model not loaded
+    /// - `UnsupportedModality` - Input is not text
+    /// - `GpuError` - GPU operation failed
+    pub async fn embed_dual(&self, input: &ModelInput) -> EmbeddingResult<DualEmbedding> {
+        if !self.is_initialized() {
+            return Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id(),
+            });
+        }
+
+        self.validate_input(input)?;
+        let text = extract_text(input)?;
+
+        let state = self
+            .model_state
+            .read()
+            .map_err(|e| EmbeddingError::InternalError {
+                message: format!("SparseModel failed to acquire read lock: {}", e),
+            })?;
+
+        match &*state {
+            ModelState::Loaded {
+                weights,
+                tokenizer,
+                mlm_head,
+                projection,
+            } => {
+                let start = Instant::now();
+
+                // Step 1: Forward through BERT + MLM head to get sparse vector
+                let sparse_vector = gpu_forward_sparse(&text, weights, tokenizer, mlm_head)?;
+
+                tracing::debug!(
+                    "Sparse vector: {} non-zero elements, sparsity={:.2}%",
+                    sparse_vector.nnz(),
+                    sparse_vector.sparsity() * 100.0
+                );
+
+                // Step 2: Project sparse (30522D) -> dense (1536D)
+                let dense_vector =
+                    projection
+                        .project(&sparse_vector)
+                        .map_err(|e| EmbeddingError::GpuError {
+                            message: format!("Sparse projection failed: {}", e),
+                        })?;
+
+                let latency_us = start.elapsed().as_micros() as u64;
+
+                tracing::debug!(
+                    "Dual embedding: sparse={}D ({}nnz), dense={}D in {}us",
+                    sparse_vector.dimension,
+                    sparse_vector.nnz(),
+                    dense_vector.len(),
+                    latency_us
+                );
+
+                // Step 3: Return both vectors
+                Ok(DualEmbedding {
+                    sparse: sparse_vector,
+                    dense: ModelEmbedding {
+                        model_id: self.model_id,
+                        vector: dense_vector,
+                        latency_us,
+                        attention_weights: None,
+                        is_projected: true,
+                    },
+                })
+            }
+            _ => Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id,
+            }),
+        }
+    }
+
+    /// Embed a true batch and return BOTH sparse and dense vectors for each row.
+    pub async fn embed_dual_batch(
+        &self,
+        inputs: &[ModelInput],
+    ) -> EmbeddingResult<Vec<DualEmbedding>> {
+        if !self.is_initialized() {
+            return Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id(),
+            });
+        }
+
+        if inputs.is_empty() {
+            return Err(EmbeddingError::TrueBatchEmpty {
+                model_id: self.model_id,
+                recovery_hint: "submit at least one SparseModel input; empty batches are invalid"
+                    .to_string(),
+            });
+        }
+
+        if inputs.len() > self.config.max_batch_size {
+            return Err(EmbeddingError::ConfigError {
+                message: format!(
+                    "SPLADE true-batch size {} exceeds max_batch_size guard {} for {:?}; reduce batch size before CUDA forward",
+                    inputs.len(),
+                    self.config.max_batch_size,
+                    self.model_id
+                ),
+            });
+        }
+
+        let mut prepared = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            self.validate_input(input)?;
+            prepared.push(extract_text(input)?);
+        }
+
+        let state = self
+            .model_state
+            .read()
+            .map_err(|e| EmbeddingError::InternalError {
+                message: format!("SparseModel failed to acquire read lock: {}", e),
+            })?;
+
+        match &*state {
+            ModelState::Loaded {
+                weights,
+                tokenizer,
+                mlm_head,
+                projection,
+            } => {
+                let start = Instant::now();
+                let sparse_vectors = gpu_forward_sparse_batch(
+                    &prepared,
+                    weights,
+                    tokenizer,
+                    mlm_head,
+                    self.model_id,
+                )?;
+
+                if sparse_vectors.len() != inputs.len() {
+                    return Err(EmbeddingError::TrueBatchOutputCountMismatch {
+                        model_id: self.model_id,
+                        expected: inputs.len(),
+                        actual: sparse_vectors.len(),
+                        recovery_hint:
+                            "SPLADE true-batch sparse output count must match input batch size"
+                                .to_string(),
+                    });
+                }
+
+                for (idx, sparse) in sparse_vectors.iter().enumerate() {
+                    sparse.validate_true_batch_output(self.model_id, idx)?;
+                }
+
+                let dense_vectors = projection.project_batch(&sparse_vectors).map_err(|e| {
+                    EmbeddingError::GpuError {
+                        message: format!("SPLADE true-batch projection failed: {}", e),
+                    }
+                })?;
+
+                if dense_vectors.len() != inputs.len() {
+                    return Err(EmbeddingError::TrueBatchOutputCountMismatch {
+                        model_id: self.model_id,
+                        expected: inputs.len(),
+                        actual: dense_vectors.len(),
+                        recovery_hint:
+                            "SPLADE true-batch dense output count must match input batch size"
+                                .to_string(),
+                    });
+                }
+
+                let latency_us =
+                    ((start.elapsed().as_micros() as u64) / inputs.len() as u64).max(1);
+                sparse_vectors
+                    .into_iter()
+                    .zip(dense_vectors)
+                    .map(|(sparse, vector)| {
+                        let dense = ModelEmbedding {
+                            model_id: self.model_id,
+                            vector,
+                            latency_us,
+                            attention_weights: None,
+                            is_projected: true,
+                        };
+                        dense.validate()?;
+                        Ok(DualEmbedding { sparse, dense })
+                    })
+                    .collect()
+            }
+            _ => Err(EmbeddingError::NotInitialized {
+                model_id: self.model_id,
+            }),
+        }
+    }
+}
+
+/// Result of dual embedding containing both sparse and dense representations.
+///
+/// This type supports the E6 upgrade proposal by providing both:
+/// - Original sparse vector for Stage 1 inverted index recall
+/// - Projected dense vector for Stage 3 multi-space fusion
+#[derive(Debug, Clone)]
+pub struct DualEmbedding {
+    /// Original sparse vector (30522D, ~235 active terms).
+    /// Use for inverted index storage and exact keyword matching.
+    pub sparse: SparseVector,
+
+    /// Projected dense vector (1536D).
+    /// Use for HNSW indexing and multi-space fusion.
+    pub dense: ModelEmbedding,
+}
+
+// Implement Send and Sync manually since RwLock is involved
+unsafe impl Send for SparseModel {}
+unsafe impl Sync for SparseModel {}

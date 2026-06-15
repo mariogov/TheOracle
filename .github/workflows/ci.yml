@@ -1,0 +1,45 @@
+name: Python ME-JEPA Scope Gate
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contextgraph-local-free-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CUDA_COMPUTE_CAP: "120"
+  CUDA_HOME: /usr/local/cuda-13.2
+
+jobs:
+  python-scope:
+    name: Python Ship-Gate Scope Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Reject C-drive path drift
+        run: scripts/ci/check_no_c_drive_paths.sh
+
+      - name: Reject schema-invalid Claude Code hook outputs
+        run: scripts/ci/check_cc_hook_outputs.sh
+
+      - name: Reject proof-domain Python gate drift
+        run: |
+          python3 scripts/swebench_lite_ops.py python-proof-domain-isolation \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --output-root /tmp/contextgraph-python-proof-domain-isolation \
+            --readback-root /tmp/contextgraph-python-proof-domain-isolation-readback \
+            --skip-github \
+            --clean-output

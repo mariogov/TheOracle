@@ -1,0 +1,84 @@
+[package]
+name = "context-graph-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core domain types, traits, and business logic for Context Graph"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+config.workspace = true
+toml.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+dashmap = "5.5"
+bincode.workspace = true
+
+# RocksDB for Memory storage (TASK-P1-005: MemoryStore)
+rocksdb = "0.22"
+
+# SHA256 hashing for file content hashing (TASK-P1-004: TextChunker)
+sha2 = "0.10"
+
+# tree-sitter for AST-based code chunking (E7 Fine-Tuning Plan Phase 1)
+# Uses cAST methodology: divide-and-combine with ~500 char target chunks
+# Runtime 0.26 accepts newer grammar ABI versions such as C# language ABI 15.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.23.4"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.23.4"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.23.11"
+
+# Python-specific parser used for canonical Python AST chunking. The tree-sitter
+# Python grammar still rejects some valid f-string format-spec forms in real
+# SWE-bench sources, so Python chunking uses Ruff's current Python parser.
+ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.15.8" }
+ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.15.8" }
+ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.15.8" }
+
+# Real HNSW implementation - NO FALLBACKS
+hnsw_rs = "0.3"
+
+# Parallel batch comparisons (TASK-LOGIC-004: BatchComparator)
+rayon = "1.10"
+
+# Fast spinlock-based locking for wake_controller (TASK-17: TASK-PERF-005)
+# parking_lot provides ~100-500ns lock times vs std::sync::RwLock ~1-5μs
+parking_lot = "0.12"
+
+# Half-precision floating point for FP16 quantization (TASK-L03: E12 Quantization)
+half = "2.3"
+
+[features]
+default = []
+# Enable test utilities (stubs, zeroed() methods) for downstream crate tests
+# WARNING: Never enable this in production builds!
+test-utils = []
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { workspace = true, features = ["test-util"] }
+rand_chacha = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[test]]
+name = "file_watcher_integration"
+required-features = ["test-utils"]
+
+[[test]]
+name = "source_metadata_integration"
+required-features = ["test-utils"]

@@ -1,0 +1,21 @@
+# Context Graph Development Configuration
+# Extends default.toml with development-specific settings
+
+[general]
+phase = "ghost"
+log_level = "debug"
+
+[server]
+transport = "stdio"
+
+[storage]
+backend = "memory"
+
+[embeddings]
+provider = "stub"
+
+[cuda]
+device_id = 0
+
+[utl]
+consolidation_threshold = 0.5

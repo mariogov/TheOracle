@@ -1,0 +1,28 @@
+# Context Graph Production Configuration
+# Full-featured production deployment
+
+[general]
+phase = "nervous"
+log_level = "info"
+
+[server]
+transport = "tcp"
+tcp_port = 8080
+
+[storage]
+backend = "postgres"
+postgres_url = "${POSTGRES_URL}"
+
+[embeddings]
+provider = "local"
+model_path = "models/all-MiniLM-L6-v2"
+
+[cuda]
+device_id = 0
+
+[utl]
+consolidation_threshold = 0.7
+
+[graph]
+max_edges_per_node = 1000
+default_edge_weight = 0.5

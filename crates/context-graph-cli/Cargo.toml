@@ -1,0 +1,120 @@
+[package]
+name = "context-graph-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Context Graph Team"]
+description = "CLI tools for Context Graph session and topic coherence management"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/contextgraph/contextgraph"
+keywords = ["cli", "coherence", "topic", "context-graph"]
+
+[lib]
+name = "context_graph_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "context-graph-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "context-graph"
+path = "src/bin/context-graph.rs"
+
+[dependencies]
+context-graph-core = { path = "../context-graph-core" }
+context-graph-paths = { path = "../context-graph-paths" }
+context-graph-storage = { path = "../context-graph-storage" }
+context-graph-dynamicjepa = { path = "../context-graph-dynamicjepa" }
+context-graph-mejepa = { path = "../context-graph-mejepa" }
+context-graph-mejepa-cf = { path = "../context-graph-mejepa-cf" }
+context-graph-mejepa-hygiene = { path = "../context-graph-mejepa-hygiene" }
+context-graph-mejepa-train = { path = "../context-graph-mejepa-train" }
+# TASK-HOOKS-011: Required for semantic search (--query flag)
+context-graph-embeddings = { path = "../context-graph-embeddings" }
+
+# CLI framework
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+toml = { workspace = true }
+chrono = { workspace = true }
+bincode = { workspace = true }
+hex = "0.4"
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = "1.0"
+
+# UUIDs for node ID parsing (TASK-HOOKS-011)
+uuid = { workspace = true }
+sha2 = "0.10"
+rocksdb = "0.22"
+zip = "7.2.0"
+dirs = "5"
+# Required by governed_edit for process_group(0) + libc::kill on spawned child
+# processes (docker/python/cargo/git). Prevents grandchild leaks when a timed
+# out child has descendants.
+libc = "0.2"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tree-sitter = "0.26"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23.6"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.23.4"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.23.4"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.23.11"
+
+# Parquet file-format export (Phase 6)
+parquet = { version = "58", default-features = false, features = ["arrow", "zstd", "snap"] }
+arrow-array = "58"
+arrow-schema = "58"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.10"
+futures = "0.3"
+serial_test = "3"
+# Enable test-utils for real data access in tests (NO MOCKS per spec)
+context-graph-core = { path = "../context-graph-core", features = ["test-utils"] }
+context-graph-storage = { path = "../context-graph-storage" }
+context-graph-test-utils = { path = "../context-graph-test-utils" }
+context-graph-mcp = { path = "../context-graph-mcp" }
+
+# Performance benchmarking (TASK-P6-010)
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+# Integration test configuration
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+# E2E test configuration (executes real shell scripts)
+# Run with: cargo test --package context-graph-cli --test e2e -- --test-threads=1 --nocapture
+[[test]]
+name = "e2e"
+path = "tests/e2e/mod.rs"
+
+# Performance benchmarks (TASK-P6-010)
+# Run with: cargo bench --package context-graph-cli
+[[bench]]
+name = "cli_benchmarks"
+harness = false
+
+[features]
+default = ["cuda"]
+# context-graph-core doesn't have cuda feature, only context-graph-mcp does
+# TASK-HOOKS-011: Added context-graph-embeddings/cuda for semantic search
+cuda = ["context-graph-embeddings/cuda"]

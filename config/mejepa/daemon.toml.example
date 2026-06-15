@@ -1,0 +1,13 @@
+[daemon]
+d_root = "/var/lib/contextgraph"
+transport = "http"
+host = "127.0.0.1"
+mcp_port = 3100
+http_port = 3101
+require_private_droot = true
+enabled_languages = ["python"]
+
+[scheduler]
+enabled = true
+status_path = "/var/lib/contextgraph/state/schedulers/self_optimization_status.json"
+test_outcome_root = "/var/lib/contextgraph/runtime/test-outcomes"

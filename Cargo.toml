@@ -1,0 +1,124 @@
+# Context Graph - Workspace Manifest
+# ME-JEPA-Code: binary reality predictor for AI-generated patches
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/context-graph-mcp",
+    "crates/context-graph-core",
+    "crates/context-graph-paths",
+    "crates/context-graph-cuda",
+    "crates/context-graph-embeddings",
+    "crates/context-graph-storage",
+    "crates/context-graph-witness",
+    "crates/context-graph-solver",
+    "crates/context-graph-mincut",
+    "crates/context-graph-mejepa-corpus",
+    "crates/context-graph-mejepa-instruments",
+    "crates/context-graph-mejepa-embedders",
+    "crates/context-graph-mejepa-cf",
+    "crates/context-graph-mejepa",
+    "crates/context-graph-mejepa-shift-subscriber",
+    "crates/context-graph-mejepa-hygiene",
+    "crates/context-graph-mejepa-train",
+    "crates/context-graph-mejepa-tct",
+    "crates/context-graph-tier-compression",
+    "crates/context-graph-dynamicjepa",
+    "crates/context-graph-cli",
+    "crates/context-graph-test-utils",
+]
+default-members = [
+    "crates/context-graph-mcp",
+    "crates/context-graph-core",
+    "crates/context-graph-paths",
+    "crates/context-graph-cuda",
+    "crates/context-graph-embeddings",
+    "crates/context-graph-storage",
+    "crates/context-graph-witness",
+    "crates/context-graph-solver",
+    "crates/context-graph-mincut",
+    "crates/context-graph-mejepa-corpus",
+    "crates/context-graph-mejepa-instruments",
+    "crates/context-graph-mejepa-embedders",
+    "crates/context-graph-mejepa-cf",
+    "crates/context-graph-mejepa",
+    "crates/context-graph-mejepa-shift-subscriber",
+    "crates/context-graph-mejepa-hygiene",
+    "crates/context-graph-mejepa-train",
+    "crates/context-graph-mejepa-tct",
+    "crates/context-graph-tier-compression",
+    "crates/context-graph-dynamicjepa",
+    "crates/context-graph-cli",
+    "crates/context-graph-test-utils",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/org/context-graph"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+toml = "0.8"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Configuration
+config = "0.14"
+
+# IDs and time
+uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+rand = "0.8"
+rand_distr = "0.4"
+
+# GPU/ML - Candle framework (HuggingFace) for embedding models
+# https://github.com/huggingface/candle
+# Using 0.10.2 for cudarc 0.19.x CUDA 13.2 bindings (RTX 5090 Blackwell)
+candle-core = { version = "0.10.2", features = ["cuda"] }
+candle-nn = { version = "0.10.2", features = ["cuda"] }
+
+# Internal crates
+context-graph-core = { path = "crates/context-graph-core" }
+context-graph-paths = { path = "crates/context-graph-paths" }
+context-graph-embeddings = { path = "crates/context-graph-embeddings" }
+context-graph-cuda = { path = "crates/context-graph-cuda" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = true
+
+[profile.release-max]
+inherits = "release"
+# Use this only when final runtime throughput matters more than local build
+# latency. The default release profile keeps ThinLTO but restores parallel CGUs.
+codegen-units = 1
+
+[profile.dev]
+# Faster compile times for development
+opt-level = 0
+debug = 1                    # Line info only (not full DWARF) - ~40-60% smaller artifacts
+incremental = true
+split-debuginfo = "unpacked" # Keep debuginfo separate (can be deleted independently)
+
+[profile.dev.package."*"]
+# External dependencies don't need full debug info
+debug = false

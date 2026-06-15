@@ -1,0 +1,467 @@
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::pause_state::DEFAULT_PAUSE_STATE_PATH;
+
+use crate::error::PredictorError;
+
+pub const PANEL_DIM: usize = context_graph_mejepa_instruments::PANEL_DIM;
+pub const CONCAT_INPUT_DIM: usize = PANEL_DIM * 2;
+pub const INVERSE_ACTION_DIM: usize = 16;
+
+pub const DEFAULT_NUM_LAYERS: u8 = 6;
+pub const DEFAULT_HIDDEN_DIM: u32 = 1_024;
+pub const DEFAULT_NUM_HEADS: u8 = 8;
+pub const DEFAULT_FF_EXPANSION: u8 = 4;
+pub const DEFAULT_LAYER_NORM_EPS: f64 = 1e-5;
+
+pub const VICREG_VAR_LAMBDA: f32 = 25.0;
+pub const VICREG_COV_LAMBDA: f32 = 1.0;
+pub const VICREG_INV_LAMBDA: f32 = 25.0;
+pub const VICREG_GAMMA: f32 = 1.0;
+
+pub const GRAD_NORM_NOISE_FLOOR: f32 = 1e-12;
+pub const VRAM_STEADY_STATE_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const VRAM_WARN_THRESHOLD_BYTES: u64 = 9 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictorConfig {
+    pub num_layers: u8,
+    pub hidden_dim: u32,
+    pub num_heads: u8,
+    pub ff_expansion: u8,
+    pub layer_norm_eps: String,
+    pub activation_dtype: String,
+    pub gradient_checkpointing: bool,
+}
+
+impl Default for PredictorConfig {
+    fn default() -> Self {
+        Self {
+            num_layers: DEFAULT_NUM_LAYERS,
+            hidden_dim: DEFAULT_HIDDEN_DIM,
+            num_heads: DEFAULT_NUM_HEADS,
+            ff_expansion: DEFAULT_FF_EXPANSION,
+            layer_norm_eps: DEFAULT_LAYER_NORM_EPS.to_string(),
+            activation_dtype: "bf16".to_string(),
+            gradient_checkpointing: false,
+        }
+    }
+}
+
+impl PredictorConfig {
+    pub fn layer_norm_eps_value(&self) -> Result<f64, PredictorError> {
+        self.layer_norm_eps
+            .parse::<f64>()
+            .map_err(|err| PredictorError::ConfigInvalid {
+                detail: format!(
+                    "layer_norm_eps must parse as f64; got {:?}: {err}",
+                    self.layer_norm_eps
+                ),
+            })
+    }
+
+    pub fn validate(&self) -> Result<(), PredictorError> {
+        if self.num_layers == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "num_layers must be >= 1".to_string(),
+            });
+        }
+        if self.hidden_dim == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "hidden_dim must be >= 1".to_string(),
+            });
+        }
+        if self.num_heads == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "num_heads must be >= 1".to_string(),
+            });
+        }
+        if !self.hidden_dim.is_multiple_of(self.num_heads as u32) {
+            return Err(PredictorError::ConfigInvalid {
+                detail: format!(
+                    "hidden_dim {} must be divisible by num_heads {}",
+                    self.hidden_dim, self.num_heads
+                ),
+            });
+        }
+        if self.ff_expansion == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "ff_expansion must be >= 1".to_string(),
+            });
+        }
+        let eps = self.layer_norm_eps_value()?;
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: format!("layer_norm_eps must be finite and positive; got {eps}"),
+            });
+        }
+        if self.activation_dtype != "bf16" {
+            return Err(PredictorError::ConfigInvalid {
+                detail: format!(
+                    "activation_dtype must be bf16 for Phase 2 CUDA predictor; got {:?}",
+                    self.activation_dtype
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+pub const INFER_DEFAULT_ALPHA: f32 = 0.10;
+pub const INFER_DEFAULT_P_THRESHOLD: f32 = 0.01;
+pub const INFER_DEFAULT_MAX_CALIBRATION_AGE_DAYS: u32 = 30;
+pub const INFER_DEFAULT_MAX_CONSTELLATION_AGE_DAYS: u32 = 90;
+pub const INFER_DEFAULT_P_TEST_THRESHOLD: f32 = 0.80;
+pub const INFER_DEFAULT_OOD_REFUSE_THRESHOLD: f32 = 0.50;
+/// #686 — verdict-assembly threshold for conformal-interval width. Wider than
+/// this signals epistemic uncertainty about calibration coverage, not necessarily
+/// that the input is out-of-distribution. Previously a hardcoded `0.8` literal in
+/// `compiler.rs::compile`. Default remains `0.8` to preserve existing behavior;
+/// override via [`MeJepaInferConfig::interval_width_threshold`].
+pub const INFER_DEFAULT_INTERVAL_WIDTH_THRESHOLD: f32 = 0.80;
+pub const INFER_DEFAULT_OUTCOME_SET_MAX: usize = 2;
+pub const INFER_DEFAULT_BOOTSTRAP_DELTA_OMEGA: f32 = 0.50;
+pub const INFER_DEFAULT_BOOTSTRAP_DELTA_XI: f32 = 0.50;
+pub const INFER_DEFAULT_TRAIN_CERT_WINDOW_STEPS: usize = 128;
+pub const INFER_DEFAULT_INSTRUMENT_CACHE_CAPACITY: usize = 4096;
+pub const INFER_DEFAULT_REQUIRE_DDA_FEATURES: bool = false;
+pub const INFER_DEFAULT_REQUIRE_OOD_CALIBRATOR: bool = false;
+pub const INFER_DEFAULT_DDA_EXPECTED_EMBEDDER_COUNT: usize = 0;
+pub const INFER_MAX_DDA_EXPECTED_EMBEDDER_COUNT: usize = 256;
+pub const INFER_DEFAULT_MIN_CELL_SUPPORT_FOR_VERDICT: u32 = 50;
+pub const PATCH_SIMILARITY_CORPUS_SNAPSHOT_HASH_LEN: usize = 64;
+pub const ENV_TRAINED_CHECKPOINT_MANIFEST_PATH: &str =
+    "CONTEXTGRAPH_MEJEPA_TRAINED_CHECKPOINT_MANIFEST_PATH";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeJepaInferConfig {
+    pub alpha: f32,
+    pub p_threshold: f32,
+    pub max_calibration_age_days: u32,
+    pub max_constellation_age_days: u32,
+    pub p_test_threshold: f32,
+    pub ood_refuse_threshold: f32,
+    /// #686 — width gate for the predictor's conformal interval. When the
+    /// interval is wider than this, verdict-assembly returns `Verdict::Abstain`
+    /// ("insufficient calibration evidence to claim coverage"), not
+    /// `Verdict::OutOfDistribution`. Decoupling these two failure modes lets
+    /// the OOD verdict mean exactly what its name says — the input is outside
+    /// the training distribution — instead of conflating it with cold-start
+    /// calibration looseness.
+    pub interval_width_threshold: f32,
+    pub outcome_set_max: usize,
+    pub bootstrap_delta_omega: f32,
+    pub bootstrap_delta_xi: f32,
+    pub train_cert_window_steps: usize,
+    pub instrument_cache_capacity: usize,
+    pub require_dda_features: bool,
+    /// When true, `mejepa_verify` must consume a selected
+    /// `CF_MEJEPA_OOD_CALIBRATIONS` row; missing/corrupt/unselected
+    /// calibration fails closed instead of falling back to the static
+    /// `ood_refuse_threshold`.
+    pub require_ood_calibrator: bool,
+    /// `0` means infer the count from the first persisted DDA row and require
+    /// every covered chunk to match it. Production callers should set this to
+    /// the active routed embedder count, currently 12 for Phase D.
+    pub dda_expected_embedder_count: usize,
+    /// Pause-state file checked at the start of compile/verify.
+    /// `None` disables pause consumption for isolated tests only.
+    pub pause_state_path: Option<PathBuf>,
+    /// Minimum targeted constellation-cell support required before ME-JEPA is
+    /// allowed to emit a non-abstain verdict for operator review replacement.
+    pub min_cell_support_for_verdict: u32,
+    /// Optional TASK-PY-G-042 patch-similarity index root. When set, compile()
+    /// loads the persisted HNSW graph and writes `closest_exemplars`.
+    pub patch_similarity_index_dir: Option<PathBuf>,
+    /// Expected 64-hex corpus snapshot hash for the configured exemplar index.
+    pub patch_similarity_corpus_snapshot_hash: Option<String>,
+    /// Manifest for a trained ME-JEPA predictor checkpoint. Slot-preserving
+    /// CUDA compiler construction requires this field or
+    /// `CONTEXTGRAPH_MEJEPA_TRAINED_CHECKPOINT_MANIFEST_PATH`; fixture
+    /// deterministic compilers remain the only no-checkpoint path.
+    pub trained_checkpoint_manifest_path: Option<PathBuf>,
+}
+
+impl Default for MeJepaInferConfig {
+    fn default() -> Self {
+        Self {
+            alpha: INFER_DEFAULT_ALPHA,
+            p_threshold: INFER_DEFAULT_P_THRESHOLD,
+            max_calibration_age_days: INFER_DEFAULT_MAX_CALIBRATION_AGE_DAYS,
+            max_constellation_age_days: INFER_DEFAULT_MAX_CONSTELLATION_AGE_DAYS,
+            p_test_threshold: INFER_DEFAULT_P_TEST_THRESHOLD,
+            ood_refuse_threshold: INFER_DEFAULT_OOD_REFUSE_THRESHOLD,
+            interval_width_threshold: INFER_DEFAULT_INTERVAL_WIDTH_THRESHOLD,
+            outcome_set_max: INFER_DEFAULT_OUTCOME_SET_MAX,
+            bootstrap_delta_omega: INFER_DEFAULT_BOOTSTRAP_DELTA_OMEGA,
+            bootstrap_delta_xi: INFER_DEFAULT_BOOTSTRAP_DELTA_XI,
+            train_cert_window_steps: INFER_DEFAULT_TRAIN_CERT_WINDOW_STEPS,
+            instrument_cache_capacity: INFER_DEFAULT_INSTRUMENT_CACHE_CAPACITY,
+            require_dda_features: INFER_DEFAULT_REQUIRE_DDA_FEATURES,
+            require_ood_calibrator: INFER_DEFAULT_REQUIRE_OOD_CALIBRATOR,
+            dda_expected_embedder_count: INFER_DEFAULT_DDA_EXPECTED_EMBEDDER_COUNT,
+            pause_state_path: Some(PathBuf::from(DEFAULT_PAUSE_STATE_PATH)),
+            min_cell_support_for_verdict: INFER_DEFAULT_MIN_CELL_SUPPORT_FOR_VERDICT,
+            patch_similarity_index_dir: None,
+            patch_similarity_corpus_snapshot_hash: None,
+            trained_checkpoint_manifest_path: None,
+        }
+    }
+}
+
+impl MeJepaInferConfig {
+    pub fn validate(&self) -> Result<(), PredictorError> {
+        for (name, value) in [
+            ("alpha", self.alpha),
+            ("p_threshold", self.p_threshold),
+            ("p_test_threshold", self.p_test_threshold),
+            ("ood_refuse_threshold", self.ood_refuse_threshold),
+            ("bootstrap_delta_omega", self.bootstrap_delta_omega),
+            ("bootstrap_delta_xi", self.bootstrap_delta_xi),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(PredictorError::ConfigInvalid {
+                    detail: format!("{name} must be finite and in [0, 1]; got {value}"),
+                });
+            }
+        }
+        if self.alpha <= 0.0 || self.alpha >= 1.0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: format!("alpha must be strictly inside (0, 1); got {}", self.alpha),
+            });
+        }
+        if self.max_calibration_age_days == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "max_calibration_age_days must be >= 1".to_string(),
+            });
+        }
+        if self.max_constellation_age_days == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "max_constellation_age_days must be >= 1".to_string(),
+            });
+        }
+        if self.outcome_set_max == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "outcome_set_max must be >= 1".to_string(),
+            });
+        }
+        if self.train_cert_window_steps == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "train_cert_window_steps must be >= 1".to_string(),
+            });
+        }
+        if self.instrument_cache_capacity == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "instrument_cache_capacity must be >= 1".to_string(),
+            });
+        }
+        if self.dda_expected_embedder_count > INFER_MAX_DDA_EXPECTED_EMBEDDER_COUNT {
+            return Err(PredictorError::ConfigInvalid {
+                detail: format!(
+                    "dda_expected_embedder_count must be <= {INFER_MAX_DDA_EXPECTED_EMBEDDER_COUNT}; got {}",
+                    self.dda_expected_embedder_count
+                ),
+            });
+        }
+        if self
+            .pause_state_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "pause_state_path must be non-empty when configured".to_string(),
+            });
+        }
+        if self.min_cell_support_for_verdict == 0 {
+            return Err(PredictorError::ConfigInvalid {
+                detail: "min_cell_support_for_verdict must be >= 1".to_string(),
+            });
+        }
+        if let Some(path) = &self.trained_checkpoint_manifest_path {
+            validate_trained_checkpoint_manifest_path("trained_checkpoint_manifest_path", path)?;
+        }
+        match (
+            self.patch_similarity_index_dir.as_ref(),
+            self.patch_similarity_corpus_snapshot_hash.as_ref(),
+        ) {
+            (Some(path), Some(hash)) => {
+                if path.as_os_str().is_empty() {
+                    return Err(PredictorError::ConfigInvalid {
+                        detail: "patch_similarity_index_dir must be non-empty when configured"
+                            .to_string(),
+                    });
+                }
+                if hash.len() != PATCH_SIMILARITY_CORPUS_SNAPSHOT_HASH_LEN
+                    || !hash.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err(PredictorError::ConfigInvalid {
+                        detail: "patch_similarity_corpus_snapshot_hash must be 64 hex chars"
+                            .to_string(),
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(PredictorError::ConfigInvalid {
+                    detail: "patch_similarity_index_dir and patch_similarity_corpus_snapshot_hash must be configured together".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn resolve_required_trained_checkpoint_manifest_path(
+    configured: Option<&PathBuf>,
+) -> Result<PathBuf, PredictorError> {
+    resolve_required_trained_checkpoint_manifest_path_from(
+        configured.map(PathBuf::as_path),
+        std::env::var_os(ENV_TRAINED_CHECKPOINT_MANIFEST_PATH),
+    )
+}
+
+pub(crate) fn resolve_required_trained_checkpoint_manifest_path_from(
+    configured: Option<&Path>,
+    env_value: Option<OsString>,
+) -> Result<PathBuf, PredictorError> {
+    let path = match configured {
+        Some(path) => path.to_path_buf(),
+        None => env_value
+            .map(PathBuf::from)
+            .ok_or_else(|| PredictorError::ConfigInvalid {
+                detail: format!(
+                    "slot-preserving CUDA compiler requires trained_checkpoint_manifest_path or {ENV_TRAINED_CHECKPOINT_MANIFEST_PATH}; refusing untrained diagnostic predictor weights"
+                ),
+            })?,
+    };
+    validate_trained_checkpoint_manifest_path("trained_checkpoint_manifest_path", &path)?;
+    Ok(path)
+}
+
+fn validate_trained_checkpoint_manifest_path(
+    field: &'static str,
+    path: &Path,
+) -> Result<(), PredictorError> {
+    validate_prodhost_checkpoint_path(field, path)?;
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Err(PredictorError::ConfigInvalid {
+            detail: format!("{field} must point to a JSON manifest artifact"),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_prodhost_checkpoint_path(
+    field: &'static str,
+    path: &Path,
+) -> Result<(), PredictorError> {
+    if path.as_os_str().is_empty() {
+        return Err(PredictorError::ConfigInvalid {
+            detail: format!("{field} must be non-empty when configured"),
+        });
+    }
+    let display = path.to_string_lossy();
+    if !display.starts_with("/var/lib/contextgraph/")
+        && !display.starts_with("/var/cache/contextgraph/")
+    {
+        return Err(PredictorError::ConfigInvalid {
+            detail: format!(
+                "{field} must live under prodhost /var/lib/contextgraph or /var/cache/contextgraph; got {display}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_phase2_contract() {
+        let config = PredictorConfig::default();
+        assert_eq!(PANEL_DIM, 5_120);
+        assert_eq!(CONCAT_INPUT_DIM, 10_240);
+        assert_eq!(INVERSE_ACTION_DIM, 16);
+        assert_eq!(config.num_layers, 6);
+        assert_eq!(config.hidden_dim, 1_024);
+        assert_eq!(config.num_heads, 8);
+        config.validate().expect("default config must validate");
+
+        let infer = MeJepaInferConfig::default();
+        assert_eq!(
+            infer.min_cell_support_for_verdict,
+            INFER_DEFAULT_MIN_CELL_SUPPORT_FOR_VERDICT
+        );
+        infer
+            .validate()
+            .expect("default inference config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_non_divisible_heads() {
+        let config = PredictorConfig {
+            hidden_dim: 1_025,
+            ..PredictorConfig::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("non-divisible heads must fail");
+        assert_eq!(err.code(), "MEJEPA_PRED_CONFIG_INVALID");
+    }
+
+    #[test]
+    fn inference_config_rejects_zero_cold_cell_support_threshold() {
+        let config = MeJepaInferConfig {
+            min_cell_support_for_verdict: 0,
+            ..MeJepaInferConfig::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("zero cold-cell support threshold must fail closed");
+        assert_eq!(err.code(), "MEJEPA_PRED_CONFIG_INVALID");
+    }
+
+    #[test]
+    fn required_trained_checkpoint_resolution_rejects_missing_config_and_env() {
+        let err = resolve_required_trained_checkpoint_manifest_path_from(None, None)
+            .expect_err("slot-preserving CUDA compiler must not run untrained");
+        assert_eq!(err.code(), "MEJEPA_PRED_CONFIG_INVALID");
+        assert!(err
+            .to_string()
+            .contains("CONTEXTGRAPH_MEJEPA_TRAINED_CHECKPOINT_MANIFEST_PATH"));
+    }
+
+    #[test]
+    fn required_trained_checkpoint_resolution_accepts_prodhost_json_env() {
+        let path = resolve_required_trained_checkpoint_manifest_path_from(
+            None,
+            Some(OsString::from(
+                "/var/lib/contextgraph/models/example/best.manifest.json",
+            )),
+        )
+        .expect("prodhost JSON manifest env path should be accepted");
+        assert_eq!(
+            path,
+            PathBuf::from("/var/lib/contextgraph/models/example/best.manifest.json")
+        );
+    }
+
+    #[test]
+    fn required_trained_checkpoint_resolution_rejects_non_json_env() {
+        let err = resolve_required_trained_checkpoint_manifest_path_from(
+            None,
+            Some(OsString::from(
+                "/var/lib/contextgraph/models/example/best.safetensors",
+            )),
+        )
+        .expect_err("manifest path must be JSON");
+        assert_eq!(err.code(), "MEJEPA_PRED_CONFIG_INVALID");
+        assert!(err.to_string().contains("JSON manifest"));
+    }
+}

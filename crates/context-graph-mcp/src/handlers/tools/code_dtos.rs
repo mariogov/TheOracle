@@ -1,0 +1,485 @@
+//! DTOs for E7 code search MCP tools.
+//!
+//! Per PRD v6 and CLAUDE.md, E7 (V_correctness) provides:
+//! - Code patterns and function signatures via 1536D dense embeddings
+//! - Code-specific understanding that E1 misses by treating code as natural language
+//!
+//! # Constitution Compliance
+//!
+//! - ARCH-12: E1 is the semantic foundation, E7 enhances with code understanding
+//! - ARCH-13: Supports multiple strategies: E1Only, MultiSpace, Pipeline
+//! - E7 finds: "Code patterns, function signatures" that E1 misses by "Treating code as NL"
+//! - Use E7 for: "Code queries (implementations, functions)"
+//! - FAIL FAST: All errors propagate immediately with logging
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use uuid::Uuid;
+
+use context_graph_core::traits::SearchStrategy;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/// Default topK for code search results.
+pub const DEFAULT_CODE_SEARCH_TOP_K: usize = 10;
+
+/// Maximum topK for code search results.
+pub const MAX_CODE_SEARCH_TOP_K: usize = 50;
+
+/// Default minimum score threshold for code search results.
+pub const DEFAULT_MIN_CODE_SCORE: f32 = 0.2;
+
+/// Default blend weight for E7 vs E1 semantic.
+/// 0.4 means 60% E1 semantic + 40% E7 code.
+/// E7 needs significant weight for code-specific queries.
+pub const DEFAULT_CODE_BLEND: f32 = 0.4;
+
+// ============================================================================
+// CODE SEARCH MODE
+// ============================================================================
+
+/// Code search mode for controlling E1/E7 scoring strategy.
+///
+/// Per ARCH-12: E1 is the semantic foundation, E7 enhances with code understanding.
+/// All modes produce scores in [0, 1] range.
+///
+/// MED-17: The former `Pipeline` variant was removed because it was identical to
+/// `Hybrid`. Input `"pipeline"` is deserialized as `Hybrid` for backward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum CodeSearchMode {
+    /// Blend E1 semantic and E7 code scores.
+    /// Score = (1-blend)*E1 + blend*E7
+    /// Best for: balanced code search with semantic understanding.
+    #[default]
+    Hybrid,
+
+    /// Pure E7 code search (ignores E1 semantic).
+    /// Best for: function signatures, impl blocks, struct/enum definitions.
+    E7Only,
+
+    /// E1 primary (90%) with E7 tiebreaker (10%).
+    /// Best for: natural language queries about code functionality.
+    E1WithE7Rerank,
+}
+
+/// MED-17: Custom deserializer that maps "pipeline" to Hybrid for backward compatibility.
+impl<'de> serde::Deserialize<'de> for CodeSearchMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "hybrid" | "Hybrid" => Ok(CodeSearchMode::Hybrid),
+            "e7Only" | "E7Only" | "e7_only" => Ok(CodeSearchMode::E7Only),
+            "e1WithE7Rerank" | "E1WithE7Rerank" | "e1_with_e7_rerank" => {
+                Ok(CodeSearchMode::E1WithE7Rerank)
+            }
+            "pipeline" | "Pipeline" => {
+                tracing::debug!(
+                    "CodeSearchMode 'pipeline' mapped to 'hybrid' (MED-17: Pipeline was identical to Hybrid)"
+                );
+                Ok(CodeSearchMode::Hybrid)
+            }
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["hybrid", "e7Only", "e1WithE7Rerank"],
+            )),
+        }
+    }
+}
+
+impl fmt::Display for CodeSearchMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodeSearchMode::Hybrid => write!(f, "hybrid"),
+            CodeSearchMode::E7Only => write!(f, "e7_only"),
+            CodeSearchMode::E1WithE7Rerank => write!(f, "e1_with_e7_rerank"),
+        }
+    }
+}
+
+// ============================================================================
+// DETECTED LANGUAGE
+// ============================================================================
+
+/// Detected programming language in query.
+#[derive(Debug, Clone, Serialize)]
+pub struct DetectedLanguageInfo {
+    /// Primary language detected (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_language: Option<String>,
+
+    /// Confidence score for language detection (0-1).
+    pub confidence: f32,
+
+    /// Indicators that led to detection.
+    pub indicators: Vec<String>,
+}
+
+// ============================================================================
+// REQUEST DTOs
+// ============================================================================
+
+/// Request parameters for search_code tool.
+///
+/// # Example JSON
+/// ```json
+/// {
+///   "query": "async function that handles HTTP requests",
+///   "topK": 10,
+///   "minScore": 0.2,
+///   "blendWithSemantic": 0.4,
+///   "searchMode": "hybrid",
+///   "languageHint": "rust",
+///   "includeContent": true
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchCodeRequest {
+    /// The code query to search for (required).
+    /// Can describe functionality, patterns, or specific code constructs.
+    pub query: String,
+
+    /// Maximum number of results to return (1-50, default: 10).
+    #[serde(rename = "topK", default = "default_top_k")]
+    pub top_k: usize,
+
+    /// Minimum score threshold (0-1, default: 0.2).
+    #[serde(rename = "minScore", default = "default_min_score")]
+    pub min_score: f32,
+
+    /// Blend weight for E7 code vs E1 semantic (0-1, default: 0.4).
+    /// 0.0 = pure E1 semantic, 1.0 = pure E7 code.
+    /// Only used in Hybrid mode.
+    #[serde(rename = "blendWithSemantic", default = "default_blend")]
+    pub blend_with_semantic: f32,
+
+    /// Search mode controlling E1/E7 strategy (default: "hybrid").
+    /// - "hybrid": Blend E1 and E7 scores
+    /// - "e7Only": Pure E7 code search
+    /// - "e1WithE7Rerank": E1 retrieval with E7 reranking
+    #[serde(rename = "searchMode", default)]
+    pub search_mode: CodeSearchMode,
+
+    /// Optional language hint to boost language-specific results.
+    /// Supports: rust, python, javascript, typescript, go, java, cpp, sql
+    #[serde(rename = "languageHint", default)]
+    pub language_hint: Option<String>,
+
+    /// Whether to include full content text in results (default: false).
+    #[serde(rename = "includeContent", default)]
+    pub include_content: bool,
+}
+
+fn default_top_k() -> usize {
+    DEFAULT_CODE_SEARCH_TOP_K
+}
+
+fn default_min_score() -> f32 {
+    DEFAULT_MIN_CODE_SCORE
+}
+
+fn default_blend() -> f32 {
+    DEFAULT_CODE_BLEND
+}
+
+impl Default for SearchCodeRequest {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            top_k: DEFAULT_CODE_SEARCH_TOP_K,
+            min_score: DEFAULT_MIN_CODE_SCORE,
+            blend_with_semantic: DEFAULT_CODE_BLEND,
+            search_mode: CodeSearchMode::Hybrid,
+            language_hint: None,
+            include_content: false,
+        }
+    }
+}
+
+impl SearchCodeRequest {
+    /// Parse the search mode into SearchStrategy enum.
+    ///
+    /// TST-M2: Maps each CodeSearchMode variant to the correct SearchStrategy:
+    /// - Hybrid -> MultiSpace (blended E1+E7 fusion per ARCH-21)
+    /// - E7Only -> E1Only (single-embedder mode; E7 weighting handled by caller)
+    /// - E1WithE7Rerank -> MultiSpace (E1 primary with E7 tiebreaker per ARCH-12)
+    pub fn parse_strategy(&self) -> SearchStrategy {
+        match self.search_mode {
+            CodeSearchMode::Hybrid => SearchStrategy::MultiSpace,
+            CodeSearchMode::E7Only => SearchStrategy::E1Only,
+            CodeSearchMode::E1WithE7Rerank => SearchStrategy::MultiSpace,
+        }
+    }
+
+    /// Validate the request parameters.
+    ///
+    /// # Errors
+    /// Returns an error message if:
+    /// - query is empty
+    /// - topK is outside [1, 50]
+    /// - minScore is outside [0, 1] or NaN/infinite
+    /// - blendWithSemantic is outside [0, 1] or NaN/infinite
+    pub fn validate(&self) -> Result<(), String> {
+        if self.query.is_empty() {
+            return Err("query is required and cannot be empty".to_string());
+        }
+
+        if self.top_k < 1 || self.top_k > MAX_CODE_SEARCH_TOP_K {
+            return Err(format!(
+                "topK must be between 1 and {}, got {}",
+                MAX_CODE_SEARCH_TOP_K, self.top_k
+            ));
+        }
+
+        if self.min_score.is_nan() || self.min_score.is_infinite() {
+            return Err("minScore must be a finite number".to_string());
+        }
+
+        if self.min_score < 0.0 || self.min_score > 1.0 {
+            return Err(format!(
+                "minScore must be between 0.0 and 1.0, got {}",
+                self.min_score
+            ));
+        }
+
+        if self.blend_with_semantic.is_nan() || self.blend_with_semantic.is_infinite() {
+            return Err("blendWithSemantic must be a finite number".to_string());
+        }
+
+        if self.blend_with_semantic < 0.0 || self.blend_with_semantic > 1.0 {
+            return Err(format!(
+                "blendWithSemantic must be between 0.0 and 1.0, got {}",
+                self.blend_with_semantic
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// TRAIT IMPLS (parse_request helper)
+// ============================================================================
+
+impl super::validate::Validate for SearchCodeRequest {
+    fn validate(&self) -> Result<(), String> {
+        self.validate()
+    }
+}
+
+// ============================================================================
+// RESPONSE DTOs
+// ============================================================================
+
+/// A single search result for code search.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeSearchResult {
+    /// UUID of the matched memory.
+    #[serde(rename = "memoryId")]
+    pub memory_id: Uuid,
+
+    /// Blended score (E1 semantic + E7 code).
+    pub score: f32,
+
+    /// Raw E1 semantic similarity (before blending).
+    #[serde(rename = "e1Similarity")]
+    pub e1_similarity: f32,
+
+    /// Raw E7 code similarity (before blending).
+    #[serde(rename = "e7CodeScore")]
+    pub e7_code_score: f32,
+
+    /// Full content text (if includeContent=true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+
+    /// Source provenance information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<CodeSourceInfo>,
+}
+
+/// Source provenance information.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeSourceInfo {
+    /// Type of source (HookDescription, ClaudeResponse, MDFileChunk).
+    #[serde(rename = "sourceType")]
+    pub source_type: String,
+
+    /// File path if from file source.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "filePath")]
+    pub file_path: Option<String>,
+
+    /// Hook type if from hook source.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hookType")]
+    pub hook_type: Option<String>,
+
+    /// Tool name if from tool use.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolName")]
+    pub tool_name: Option<String>,
+}
+
+/// Response metadata for code search.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeSearchMetadata {
+    /// Number of candidates evaluated before filtering.
+    #[serde(rename = "candidatesEvaluated")]
+    pub candidates_evaluated: usize,
+
+    /// Number of results filtered by score threshold.
+    #[serde(rename = "filteredByScore")]
+    pub filtered_by_score: usize,
+
+    /// Search mode used.
+    #[serde(rename = "searchMode")]
+    pub search_mode: CodeSearchMode,
+
+    /// E7 blend weight used (only for Hybrid mode).
+    #[serde(rename = "e7BlendWeight")]
+    pub e7_blend_weight: f32,
+
+    /// E1 weight (1.0 - e7BlendWeight, only for Hybrid mode).
+    #[serde(rename = "e1Weight")]
+    pub e1_weight: f32,
+
+    /// Language hint provided (if any).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "languageHint")]
+    pub language_hint: Option<String>,
+
+    /// Detected language info from query.
+    #[serde(rename = "detectedLanguage")]
+    pub detected_language: DetectedLanguageInfo,
+}
+
+/// Response for search_code tool.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchCodeResponse {
+    /// Original query.
+    pub query: String,
+
+    /// Matched results with blended scores.
+    pub results: Vec<CodeSearchResult>,
+
+    /// Number of results returned.
+    pub count: usize,
+
+    /// Metadata about the search.
+    pub metadata: CodeSearchMetadata,
+
+    /// Code entity results from CodeStore (if code pipeline is enabled).
+    /// E7-WIRING: Added for direct code search results.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "codeEntities")]
+    pub code_entities: Option<Vec<CodeEntityResult>>,
+}
+
+// ============================================================================
+// CODE ENTITY RESULTS (E7-WIRING)
+// ============================================================================
+
+/// A code entity search result from CodeStore.
+///
+/// E7-WIRING: Added for direct code search via E7 embeddings.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeEntityResult {
+    /// Entity UUID.
+    pub id: String,
+
+    /// Entity name (function, struct, etc.).
+    pub name: String,
+
+    /// Entity type (Function, Struct, Trait, etc.).
+    #[serde(rename = "entityType")]
+    pub entity_type: String,
+
+    /// E7 similarity score.
+    pub score: f32,
+
+    /// File path where entity is defined.
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+
+    /// Line number where entity starts.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "startLine")]
+    pub start_line: Option<usize>,
+
+    /// Line number where entity ends.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "endLine")]
+    pub end_line: Option<usize>,
+
+    /// Code content (if requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+
+    /// Parent scope chain (e.g., ["mod foo", "impl Bar"]).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "scopeChain")]
+    pub scope_chain: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_happy_path_deserialization() {
+        let req = SearchCodeRequest {
+            query: "async function HTTP handler".to_string(),
+            ..Default::default()
+        };
+        assert!(req.validate().is_ok());
+        assert!((req.blend_with_semantic - DEFAULT_CODE_BLEND).abs() < 0.001);
+        assert_eq!(req.search_mode, CodeSearchMode::Hybrid);
+    }
+
+    #[test]
+    fn test_validation_rejects_invalid() {
+        assert!(SearchCodeRequest::default().validate().is_err());
+        let bad_blend = SearchCodeRequest {
+            query: "test".to_string(),
+            blend_with_semantic: 1.5,
+            ..Default::default()
+        };
+        assert!(bad_blend.validate().is_err());
+        let bad_k = SearchCodeRequest {
+            query: "test".to_string(),
+            top_k: 100,
+            ..Default::default()
+        };
+        assert!(bad_k.validate().is_err());
+    }
+
+    #[test]
+    fn test_parse_strategy_respects_search_mode() {
+        // TST-M2: parse_strategy must respect search_mode, not always return MultiSpace
+        let hybrid = SearchCodeRequest {
+            query: "test".to_string(),
+            search_mode: CodeSearchMode::Hybrid,
+            ..Default::default()
+        };
+        assert_eq!(hybrid.parse_strategy(), SearchStrategy::MultiSpace);
+
+        let e7_only = SearchCodeRequest {
+            query: "test".to_string(),
+            search_mode: CodeSearchMode::E7Only,
+            ..Default::default()
+        };
+        assert_eq!(e7_only.parse_strategy(), SearchStrategy::E1Only);
+
+        let rerank = SearchCodeRequest {
+            query: "test".to_string(),
+            search_mode: CodeSearchMode::E1WithE7Rerank,
+            ..Default::default()
+        };
+        assert_eq!(rerank.parse_strategy(), SearchStrategy::MultiSpace);
+    }
+
+    #[test]
+    fn test_response_serialization() {
+        let mode_json = serde_json::to_string(&CodeSearchMode::Hybrid).unwrap();
+        assert_eq!(mode_json, "\"Hybrid\"");
+        let mode_json = serde_json::to_string(&CodeSearchMode::E7Only).unwrap();
+        assert_eq!(mode_json, "\"E7Only\"");
+    }
+}

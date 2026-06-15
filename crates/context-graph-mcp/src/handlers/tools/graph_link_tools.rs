@@ -1,0 +1,1506 @@
+//! Graph linking tool implementations (get_memory_neighbors, get_typed_edges, traverse_graph).
+//!
+//! # Knowledge Graph Linking Tools
+//!
+//! These tools expose the K-NN graph and typed edge infrastructure:
+//! - `get_memory_neighbors`: K-NN neighbors in specific embedder space
+//! - `get_typed_edges`: Typed edges derived from embedder agreement patterns
+//! - `traverse_graph`: Multi-hop graph traversal following typed edges
+//!
+//! ## Constitution Compliance
+//!
+//! - ARCH-18: E5/E8 use asymmetric similarity (direction matters)
+//! - AP-60: Temporal embedders (E2-E4) never count toward edge type detection
+//! - AP-77: E5 MUST NOT use symmetric cosine
+//! - AP-02: All comparisons within same embedder space (no cross-embedder)
+//! - FAIL FAST: All errors propagate immediately with logging - NO FALLBACKS
+//!
+//! ## TASK-GRAPHLINK: EdgeRepository Integration
+//!
+//! All graph linking tools now use EdgeRepository directly:
+//! - NO FALLBACKS - if EdgeRepository is not available, tools error
+//! - K-NN edges from embedder_edges column family
+//! - Typed edges from typed_edges column family
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use tracing::{debug, error, info};
+use uuid::Uuid;
+
+use context_graph_core::graph_linking::GraphLinkEdgeType;
+use context_graph_core::types::fingerprint::NUM_EMBEDDERS;
+use context_graph_core::weights::get_effective_weight_profile;
+
+use crate::protocol::JsonRpcId;
+use crate::protocol::JsonRpcResponse;
+
+use super::graph_learning_tools::{
+    resolve_graph_learning_policy, GraphLearningPolicyResolveParams,
+};
+use super::graph_link_dtos::{
+    embedder_name, embedder_name_to_index, uses_asymmetric_similarity, AgreementSummary,
+    EmbedderContribution, GetMemoryNeighborsRequest, GetMemoryNeighborsResponse,
+    GetTypedEdgesRequest, GetTypedEdgesResponse, GetUnifiedNeighborsRequest,
+    GetUnifiedNeighborsResponse, NeighborResult, NeighborSearchMetadata, NeighborSourceInfo,
+    TraversalMetadata, TraversalNode, TraversalPath, TraverseGraphRequest, TraverseGraphResponse,
+    TypedEdgeMetadata, TypedEdgeResult, UnifiedNeighborMetadata, UnifiedNeighborResult,
+    EMBEDDER_NAMES, RRF_K, SEMANTIC_EMBEDDER_INDICES,
+};
+
+use super::super::Handlers;
+use super::helpers::ToolErrorKind;
+
+impl Handlers {
+    /// get_memory_neighbors tool implementation.
+    ///
+    /// Finds K nearest neighbors of a memory in a specific embedder space.
+    /// TASK-GRAPHLINK: Uses EdgeRepository directly - NO FALLBACKS.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Validate request and verify memory exists
+    /// 2. Query EdgeRepository.get_embedder_edges() for K-NN neighbors
+    /// 3. Apply min_similarity filter
+    /// 4. Optionally hydrate content and source metadata
+    ///
+    /// # Parameters
+    ///
+    /// - `memory_id`: UUID of the memory to find neighbors for (required)
+    /// - `embedder_id`: Embedder space to search (0-13, default: 0=E1)
+    /// - `top_k`: Number of neighbors to return (1-50, default: 10)
+    /// - `min_similarity`: Minimum similarity threshold (0-1, default: 0.0)
+    /// - `include_content`: Include full content text (default: false)
+    pub(crate) async fn call_get_memory_neighbors(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        // NO FALLBACKS — edges must be built at startup. If empty, fail fast.
+
+        // TASK-GRAPHLINK: Require EdgeRepository - NO FALLBACKS
+        let edge_repo = match &self.edge_repository {
+            Some(repo) => repo,
+            None => {
+                error!("get_memory_neighbors: EdgeRepository not available - NO FALLBACKS");
+                return self.tool_error(
+                    id,
+                    "Graph linking not initialized. EdgeRepository is required - NO FALLBACKS.",
+                );
+            }
+        };
+
+        // Parse and validate request
+        let (request, memory_uuid) = match self
+            .parse_request_validated::<GetMemoryNeighborsRequest>(
+                id.clone(),
+                args,
+                "get_memory_neighbors",
+            ) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+        let embedder_id = request.embedder_id;
+        let top_k = request.top_k;
+        let min_similarity = request.min_similarity;
+        let emb_name = embedder_name(embedder_id);
+        let uses_asymmetric = uses_asymmetric_similarity(embedder_id);
+
+        info!(
+            memory_id = %memory_uuid,
+            embedder_id = embedder_id,
+            embedder_name = %emb_name,
+            top_k = top_k,
+            min_similarity = min_similarity,
+            uses_asymmetric = uses_asymmetric,
+            "get_memory_neighbors: Starting K-NN neighbor search via EdgeRepository"
+        );
+
+        // Step 1: Verify memory exists
+        match self.teleological_store.retrieve(memory_uuid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!(memory_id = %memory_uuid, "get_memory_neighbors: Memory not found");
+                return self.tool_error(id, &format!("Memory not found: {}", memory_uuid));
+            }
+            Err(e) => {
+                error!(error = %e, "get_memory_neighbors: Failed to retrieve memory");
+                return self.tool_error(id, &format!("Failed to retrieve memory: {}", e));
+            }
+        };
+
+        debug!(memory_id = %memory_uuid, "Memory verified, querying EdgeRepository");
+
+        // Step 2: Query EdgeRepository for K-NN neighbors - NO FALLBACKS
+        let embedder_edges = match edge_repo.get_embedder_edges(embedder_id as u8, memory_uuid) {
+            Ok(edges) => edges,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    memory_id = %memory_uuid,
+                    embedder_id = embedder_id,
+                    "get_memory_neighbors: EdgeRepository query failed - NO FALLBACKS"
+                );
+                return self.tool_error(
+                    id,
+                    &format!(
+                        "EdgeRepository query failed for embedder {}: {}. NO FALLBACKS.",
+                        embedder_id, e
+                    ),
+                );
+            }
+        };
+
+        let candidates_evaluated = embedder_edges.len();
+        let mut filtered_count = 0;
+
+        info!(
+            candidates_evaluated = candidates_evaluated,
+            embedder_id = embedder_id,
+            "get_memory_neighbors: Retrieved {} K-NN edges from EdgeRepository",
+            candidates_evaluated
+        );
+
+        if candidates_evaluated == 0 {
+            let repo_empty = match edge_repo.is_empty() {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        memory_id = %memory_uuid,
+                        embedder_id = embedder_id,
+                        "get_memory_neighbors: failed to inspect EdgeRepository emptiness after zero K-NN edges"
+                    );
+                    return self.tool_error(
+                        id,
+                        &format!(
+                            "EdgeRepository returned zero K-NN edges and is_empty() failed: {}. NO FALLBACKS.",
+                            e
+                        ),
+                    );
+                }
+            };
+            let fp_count = match self.teleological_store.count().await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        memory_id = %memory_uuid,
+                        embedder_id = embedder_id,
+                        "get_memory_neighbors: failed to inspect fingerprint count after zero K-NN edges"
+                    );
+                    return self.tool_error(
+                        id,
+                        &format!(
+                            "EdgeRepository returned zero K-NN edges and fingerprint count failed: {}. NO FALLBACKS.",
+                            e
+                        ),
+                    );
+                }
+            };
+            error!(
+                memory_id = %memory_uuid,
+                embedder_id = embedder_id,
+                embedder_name = %emb_name,
+                repo_empty = repo_empty,
+                total_fingerprints_in_store = fp_count,
+                "get_memory_neighbors: ZERO K-NN edges found; failing closed"
+            );
+            return self.tool_error(
+                id,
+                &format!(
+                    "No K-NN graph edges exist for memory {} in embedder {} ({}). \
+                     EdgeRepository empty={}, total_fingerprints_in_store={}. \
+                     Run or repair graph building; NO FALLBACKS.",
+                    memory_uuid, embedder_id, emb_name, repo_empty, fp_count
+                ),
+            );
+        }
+
+        // Step 3: Filter and prepare neighbors
+        let mut neighbors: Vec<NeighborResult> = embedder_edges
+            .into_iter()
+            .filter_map(|edge| {
+                if edge.similarity() < min_similarity {
+                    filtered_count += 1;
+                    return None;
+                }
+                Some(NeighborResult {
+                    neighbor_id: edge.target(),
+                    similarity: edge.similarity(),
+                    content: None,
+                    source: None,
+                })
+            })
+            .take(top_k)
+            .collect();
+
+        // Step 4: Optionally hydrate content and source metadata
+        if !neighbors.is_empty() {
+            let neighbor_ids: Vec<Uuid> = neighbors.iter().map(|n| n.neighbor_id).collect();
+
+            // Get source metadata - error if fails (NO FALLBACKS)
+            let source_metadata = match self
+                .teleological_store
+                .get_source_metadata_batch(&neighbor_ids)
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(error = %e, "get_memory_neighbors: Source metadata retrieval failed - NO FALLBACKS");
+                    return self.tool_error(
+                        id,
+                        &format!("Failed to retrieve source metadata: {}. NO FALLBACKS.", e),
+                    );
+                }
+            };
+
+            // Get content if requested - error if fails (NO FALLBACKS)
+            let contents: Vec<Option<String>> = if request.include_content {
+                match self
+                    .teleological_store
+                    .get_content_batch(&neighbor_ids)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(error = %e, "get_memory_neighbors: Content retrieval failed - NO FALLBACKS");
+                        return self.tool_error(
+                            id,
+                            &format!("Failed to retrieve content: {}. NO FALLBACKS.", e),
+                        );
+                    }
+                }
+            } else {
+                vec![None; neighbor_ids.len()]
+            };
+
+            // Populate metadata
+            for (i, neighbor) in neighbors.iter_mut().enumerate() {
+                if let Some(Some(ref metadata)) = source_metadata.get(i) {
+                    neighbor.source = Some(NeighborSourceInfo {
+                        source_type: format!("{}", metadata.source_type),
+                        file_path: metadata.file_path.clone(),
+                    });
+                }
+                if request.include_content {
+                    if let Some(content_opt) = contents.get(i) {
+                        neighbor.content = content_opt.clone();
+                    }
+                }
+            }
+        }
+
+        let count = neighbors.len();
+        let response = GetMemoryNeighborsResponse {
+            memory_id: memory_uuid,
+            embedder_id,
+            embedder_name: emb_name.to_string(),
+            count,
+            neighbors,
+            metadata: NeighborSearchMetadata {
+                candidates_evaluated,
+                filtered_by_similarity: filtered_count,
+                used_asymmetric: uses_asymmetric,
+            },
+        };
+
+        match serde_json::to_value(&response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => {
+                error!(error = %e, "get_memory_neighbors: Response serialization failed");
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("Response serialization failed: {}", e),
+                )
+            }
+        }
+    }
+
+    /// get_typed_edges tool implementation.
+    ///
+    /// Gets typed edges from a memory based on embedder agreement patterns.
+    /// TASK-GRAPHLINK: Uses EdgeRepository directly - NO FALLBACKS.
+    ///
+    /// # Edge Types
+    ///
+    /// - semantic_similar: E1 strongly agrees
+    /// - code_related: E7 strongly agrees
+    /// - entity_shared: E11 strongly agrees
+    /// - causal_chain: E5 strongly agrees
+    /// - graph_connected: E8 strongly agrees
+    /// - paraphrase_aligned: E10 strongly agrees
+    /// - keyword_overlap: E6/E13 strongly agree
+    /// - multi_agreement: Multiple embedders agree (weighted_agreement >= 2.5)
+    ///
+    /// # Parameters
+    ///
+    /// - `memory_id`: UUID of the memory to get edges from (required)
+    /// - `edge_type`: Filter by edge type (optional)
+    /// - `direction`: "outgoing", "incoming", or "both" (default: "outgoing")
+    /// - `min_weight`: Minimum edge weight threshold (0-1, default: 0.0)
+    /// - `include_content`: Include full content text (default: false)
+    pub(crate) async fn call_get_typed_edges(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        // NO FALLBACKS — edges must be built at startup. If empty, fail fast.
+
+        // TASK-GRAPHLINK: Require EdgeRepository - NO FALLBACKS
+        let edge_repo = match &self.edge_repository {
+            Some(repo) => repo,
+            None => {
+                error!("get_typed_edges: EdgeRepository not available - NO FALLBACKS");
+                return self.tool_error(
+                    id,
+                    "Graph linking not initialized. EdgeRepository is required - NO FALLBACKS.",
+                );
+            }
+        };
+
+        // Parse and validate request
+        let (request, memory_uuid) = match self.parse_request_validated::<GetTypedEdgesRequest>(
+            id.clone(),
+            args,
+            "get_typed_edges",
+        ) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+        let edge_type_filter = request.edge_type.clone();
+        let direction = &request.direction;
+        let min_weight = request.min_weight;
+
+        info!(
+            memory_id = %memory_uuid,
+            edge_type_filter = ?edge_type_filter,
+            direction = %direction,
+            min_weight = min_weight,
+            "get_typed_edges: Starting typed edge query via EdgeRepository"
+        );
+
+        // Step 1: Verify memory exists
+        match self.teleological_store.retrieve(memory_uuid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!(memory_id = %memory_uuid, "get_typed_edges: Memory not found");
+                return self.tool_error(id, &format!("Memory not found: {}", memory_uuid));
+            }
+            Err(e) => {
+                error!(error = %e, "get_typed_edges: Failed to retrieve memory");
+                return self.tool_error(id, &format!("Failed to retrieve memory: {}", e));
+            }
+        };
+
+        // Step 2: Query typed edges from EdgeRepository - NO FALLBACKS
+        let typed_edges = if let Some(ref filter_type) = edge_type_filter {
+            // Query by specific edge type — respect direction parameter
+            let graph_link_type = match string_to_edge_type(filter_type) {
+                Some(t) => t,
+                None => {
+                    error!(edge_type = %filter_type, "get_typed_edges: Invalid edge type");
+                    return self.tool_error(id, &format!("Invalid edge type: {}", filter_type));
+                }
+            };
+            // BUG FIX: get_typed_edges_by_type uses secondary index keyed by SOURCE uuid.
+            // For incoming edges (memory is TARGET), we must use get_typed_edges_to() and
+            // post-filter by edge type. For "both", we combine both approaches.
+            match direction.as_str() {
+                "incoming" => {
+                    // Full scan of incoming edges, post-filter by type
+                    match edge_repo.get_typed_edges_to(memory_uuid) {
+                        Ok(edges) => edges
+                            .into_iter()
+                            .filter(|e| e.edge_type() == graph_link_type)
+                            .collect(),
+                        Err(e) => {
+                            error!(error = %e, "get_typed_edges: Incoming edge query failed - NO FALLBACKS");
+                            return self.tool_error(
+                                id,
+                                &format!("Incoming query failed: {}. NO FALLBACKS.", e),
+                            );
+                        }
+                    }
+                }
+                "both" => {
+                    // Outgoing: use secondary index (fast path)
+                    let outgoing =
+                        match edge_repo.get_typed_edges_by_type(memory_uuid, graph_link_type) {
+                            Ok(edges) => edges,
+                            Err(e) => {
+                                error!(error = %e, "get_typed_edges: Outgoing type query failed");
+                                return self
+                                    .tool_error(id, &format!("Outgoing type query failed: {}", e));
+                            }
+                        };
+                    // Incoming: full scan + post-filter by type
+                    let incoming = match edge_repo.get_typed_edges_to(memory_uuid) {
+                        Ok(edges) => edges
+                            .into_iter()
+                            .filter(|e| e.edge_type() == graph_link_type)
+                            .collect::<Vec<_>>(),
+                        Err(e) => {
+                            error!(error = %e, "get_typed_edges: Incoming edge query failed");
+                            return self.tool_error(id, &format!("Incoming query failed: {}", e));
+                        }
+                    };
+                    let mut combined = outgoing;
+                    combined.extend(incoming);
+                    combined
+                }
+                _ => {
+                    // "outgoing" or default — secondary index is correct (keyed by source)
+                    match edge_repo.get_typed_edges_by_type(memory_uuid, graph_link_type) {
+                        Ok(edges) => edges,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                memory_id = %memory_uuid,
+                                edge_type = %filter_type,
+                                "get_typed_edges: EdgeRepository query by type failed - NO FALLBACKS"
+                            );
+                            return self.tool_error(
+                                id,
+                                &format!(
+                                    "EdgeRepository query failed for edge type {}: {}. NO FALLBACKS.",
+                                    filter_type, e
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // HIGH-11 FIX: Respect direction parameter
+            match direction.as_str() {
+                "incoming" => match edge_repo.get_typed_edges_to(memory_uuid) {
+                    Ok(edges) => edges,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            memory_id = %memory_uuid,
+                            direction = "incoming",
+                            "get_typed_edges: Incoming edge query failed - NO FALLBACKS"
+                        );
+                        return self.tool_error(
+                            id,
+                            &format!("EdgeRepository incoming query failed: {}. NO FALLBACKS.", e),
+                        );
+                    }
+                },
+                "both" => {
+                    let outgoing = match edge_repo.get_typed_edges_from(memory_uuid) {
+                        Ok(edges) => edges,
+                        Err(e) => {
+                            error!(error = %e, "get_typed_edges: Outgoing edge query failed");
+                            return self.tool_error(id, &format!("Outgoing query failed: {}", e));
+                        }
+                    };
+                    let incoming = match edge_repo.get_typed_edges_to(memory_uuid) {
+                        Ok(edges) => edges,
+                        Err(e) => {
+                            error!(error = %e, "get_typed_edges: Incoming edge query failed");
+                            return self.tool_error(id, &format!("Incoming query failed: {}", e));
+                        }
+                    };
+                    let mut combined = outgoing;
+                    combined.extend(incoming);
+                    combined
+                }
+                _ => {
+                    // "outgoing" or default
+                    match edge_repo.get_typed_edges_from(memory_uuid) {
+                        Ok(edges) => edges,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                memory_id = %memory_uuid,
+                                "get_typed_edges: EdgeRepository query failed - NO FALLBACKS"
+                            );
+                            return self.tool_error(
+                                id,
+                                &format!("EdgeRepository query failed: {}. NO FALLBACKS.", e),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        let total_edges = typed_edges.len();
+        let mut filtered_by_weight = 0;
+
+        info!(
+            total_edges = total_edges,
+            "get_typed_edges: Retrieved {} typed edges from EdgeRepository", total_edges
+        );
+
+        // Step 3: Filter by min_weight and convert to response format
+        let mut edges: Vec<TypedEdgeResult> = typed_edges
+            .into_iter()
+            .filter_map(|edge| {
+                if edge.weight() < min_weight {
+                    filtered_by_weight += 1;
+                    return None;
+                }
+
+                // Build contributing embedders list from agreeing embedders bitfield
+                let contributing_embedders = get_contributing_embedders(edge.agreeing_embedders());
+
+                // Determine actual direction relative to the queried memory_id.
+                // If the edge's source matches memory_uuid, it's outgoing; otherwise incoming.
+                // The "peer" is the node at the other end of the edge.
+                let (actual_direction, peer_id) = if edge.source() == memory_uuid {
+                    ("outgoing".to_string(), edge.target())
+                } else {
+                    ("incoming".to_string(), edge.source())
+                };
+
+                Some(TypedEdgeResult {
+                    target_id: peer_id,
+                    edge_type: edge_type_to_string(edge.edge_type()),
+                    weight: edge.weight(),
+                    weighted_agreement: compute_weighted_agreement(edge.embedder_scores()),
+                    direction: actual_direction,
+                    contributing_embedders,
+                    content: None,
+                })
+            })
+            .collect();
+
+        // Step 4: Optionally hydrate content
+        if request.include_content && !edges.is_empty() {
+            let edge_ids: Vec<Uuid> = edges.iter().map(|e| e.target_id).collect();
+            let contents = match self.teleological_store.get_content_batch(&edge_ids).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(error = %e, "get_typed_edges: Content retrieval failed - NO FALLBACKS");
+                    return self.tool_error(
+                        id,
+                        &format!("Failed to retrieve content: {}. NO FALLBACKS.", e),
+                    );
+                }
+            };
+
+            for (i, edge) in edges.iter_mut().enumerate() {
+                if let Some(Some(ref content)) = contents.get(i) {
+                    edge.content = Some(content.clone());
+                }
+            }
+        }
+
+        let count = edges.len();
+        let response = GetTypedEdgesResponse {
+            memory_id: memory_uuid,
+            direction: direction.clone(),
+            edge_type_filter,
+            count,
+            edges,
+            metadata: TypedEdgeMetadata {
+                total_edges,
+                filtered_by_type: 0, // Already filtered by query if specified
+                filtered_by_weight,
+            },
+        };
+
+        info!(
+            edges_found = response.count,
+            total_edges = total_edges,
+            filtered_by_weight = filtered_by_weight,
+            "get_typed_edges: Completed typed edge query via EdgeRepository"
+        );
+
+        match serde_json::to_value(&response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => {
+                error!(error = %e, "get_typed_edges: Response serialization failed");
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("Response serialization failed: {}", e),
+                )
+            }
+        }
+    }
+
+    /// traverse_graph tool implementation.
+    ///
+    /// Multi-hop graph traversal starting from a memory.
+    /// TASK-GRAPHLINK: Uses EdgeRepository directly - NO FALLBACKS.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Start from the specified memory
+    /// 2. BFS traversal following typed edges from EdgeRepository
+    /// 3. Track paths and cumulative weights
+    /// 4. Stop at max_hops or when no more edges above min_weight
+    ///
+    /// # Parameters
+    ///
+    /// - `start_memory_id`: UUID of the starting memory (required)
+    /// - `max_hops`: Maximum traversal depth (1-5, default: 2)
+    /// - `edge_type`: Filter traversal by edge type (optional)
+    /// - `min_weight`: Minimum edge weight to follow (0-1, default: 0.3)
+    /// - `max_results`: Maximum paths to return (1-100, default: 20)
+    /// - `include_content`: Include full content text (default: false)
+    pub(crate) async fn call_traverse_graph(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        // NO FALLBACKS — edges must be built at startup. If empty, fail fast.
+
+        // TASK-GRAPHLINK: Require EdgeRepository - NO FALLBACKS
+        let edge_repo = match &self.edge_repository {
+            Some(repo) => repo,
+            None => {
+                error!("traverse_graph: EdgeRepository not available - NO FALLBACKS");
+                return self.tool_error(
+                    id,
+                    "Graph linking not initialized. EdgeRepository is required - NO FALLBACKS.",
+                );
+            }
+        };
+
+        // Parse and validate request
+        let (request, start_uuid) = match self.parse_request_validated::<TraverseGraphRequest>(
+            id.clone(),
+            args,
+            "traverse_graph",
+        ) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+        let max_hops = request.max_hops;
+        let edge_type_filter = request.edge_type.clone();
+        let min_weight = request.min_weight;
+        let max_results = request.max_results;
+
+        // Convert edge_type filter string to GraphLinkEdgeType
+        let graph_link_type_filter = edge_type_filter
+            .as_ref()
+            .and_then(|s| string_to_edge_type(s));
+
+        info!(
+            start_memory_id = %start_uuid,
+            max_hops = max_hops,
+            edge_type_filter = ?edge_type_filter,
+            min_weight = min_weight,
+            max_results = max_results,
+            "traverse_graph: Starting graph traversal via EdgeRepository"
+        );
+
+        // Step 1: Verify start memory exists
+        match self.teleological_store.retrieve(start_uuid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!(memory_id = %start_uuid, "traverse_graph: Start memory not found");
+                return self.tool_error(id, &format!("Start memory not found: {}", start_uuid));
+            }
+            Err(e) => {
+                error!(error = %e, "traverse_graph: Failed to retrieve start memory");
+                return self.tool_error(id, &format!("Failed to retrieve memory: {}", e));
+            }
+        };
+
+        // Step 2: BFS traversal using EdgeRepository
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        let mut nodes: Vec<TraversalNode> = Vec::new();
+        let mut paths: Vec<TraversalPath> = Vec::new();
+        let mut edges_evaluated = 0;
+        let mut edges_filtered_by_weight = 0;
+
+        // Queue: (memory_id, hop_level, cumulative_weight, path_so_far, edge_types_so_far, edge_weights_so_far)
+        #[allow(clippy::type_complexity)]
+        let mut queue: VecDeque<(Uuid, usize, f32, Vec<Uuid>, Vec<String>, Vec<f32>)> =
+            VecDeque::new();
+        queue.push_back((start_uuid, 0, 1.0, vec![start_uuid], vec![], vec![]));
+        visited.insert(start_uuid);
+
+        // Add start node
+        nodes.push(TraversalNode {
+            memory_id: start_uuid,
+            hop_level: 0,
+            edge_type_from_parent: None,
+            edge_weight_from_parent: None,
+            cumulative_weight: 1.0,
+            content: None,
+        });
+
+        while let Some((current_id, hop_level, cumulative_weight, path, edge_types, edge_weights)) =
+            queue.pop_front()
+        {
+            // Check if we've reached max hops
+            if hop_level >= max_hops {
+                // Record this as a complete path
+                if path.len() > 1 {
+                    paths.push(TraversalPath {
+                        path: path.clone(),
+                        total_weight: cumulative_weight,
+                        hop_count: path.len() - 1,
+                        edge_types: edge_types.clone(),
+                        edge_weights: edge_weights.clone(),
+                    });
+                }
+                continue;
+            }
+
+            // Check if we have enough paths — but only break after exhausting
+            // the current BFS depth level so we don't miss equally-short paths
+            if paths.len() >= max_results
+                && hop_level > paths.iter().map(|p| p.hop_count).min().unwrap_or(0)
+            {
+                break;
+            }
+
+            // Get neighbors via EdgeRepository - NO FALLBACKS
+            let neighbors = if let Some(ref edge_type) = graph_link_type_filter {
+                match edge_repo.get_typed_edges_by_type(current_id, *edge_type) {
+                    Ok(edges) => edges,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            memory_id = %current_id,
+                            "traverse_graph: EdgeRepository query failed - NO FALLBACKS"
+                        );
+                        return self.tool_error(
+                            id,
+                            &format!(
+                                "EdgeRepository query failed during traversal: {}. NO FALLBACKS.",
+                                e
+                            ),
+                        );
+                    }
+                }
+            } else {
+                match edge_repo.get_typed_edges_from(current_id) {
+                    Ok(edges) => edges,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            memory_id = %current_id,
+                            "traverse_graph: EdgeRepository query failed - NO FALLBACKS"
+                        );
+                        return self.tool_error(
+                            id,
+                            &format!(
+                                "EdgeRepository query failed during traversal: {}. NO FALLBACKS.",
+                                e
+                            ),
+                        );
+                    }
+                }
+            };
+
+            let mut found_next_hop = false;
+
+            for neighbor in neighbors {
+                edges_evaluated += 1;
+                let neighbor_id = neighbor.target();
+
+                // Skip if already visited or is self
+                if visited.contains(&neighbor_id) || neighbor_id == current_id {
+                    continue;
+                }
+
+                // Filter by minimum weight
+                if neighbor.weight() < min_weight {
+                    edges_filtered_by_weight += 1;
+                    continue;
+                }
+
+                found_next_hop = true;
+                visited.insert(neighbor_id);
+
+                let edge_type_str = edge_type_to_string(neighbor.edge_type());
+                let new_cumulative = cumulative_weight * neighbor.weight();
+                let mut new_path = path.clone();
+                new_path.push(neighbor_id);
+                let mut new_edge_types = edge_types.clone();
+                new_edge_types.push(edge_type_str.clone());
+                let mut new_edge_weights = edge_weights.clone();
+                new_edge_weights.push(neighbor.weight());
+
+                // Add to nodes
+                nodes.push(TraversalNode {
+                    memory_id: neighbor_id,
+                    hop_level: hop_level + 1,
+                    edge_type_from_parent: Some(edge_type_str),
+                    edge_weight_from_parent: Some(neighbor.weight()),
+                    cumulative_weight: new_cumulative,
+                    content: None,
+                });
+
+                // Add to queue for next hop
+                queue.push_back((
+                    neighbor_id,
+                    hop_level + 1,
+                    new_cumulative,
+                    new_path,
+                    new_edge_types,
+                    new_edge_weights,
+                ));
+            }
+
+            // If no next hop found and we have a path, record it
+            if !found_next_hop && path.len() > 1 {
+                paths.push(TraversalPath {
+                    path: path.clone(),
+                    total_weight: cumulative_weight,
+                    hop_count: path.len() - 1,
+                    edge_types: edge_types.clone(),
+                    edge_weights: edge_weights.clone(),
+                });
+            }
+        }
+
+        // Step 3: Optionally hydrate content
+        if request.include_content && !nodes.is_empty() {
+            let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.memory_id).collect();
+            let contents = match self.teleological_store.get_content_batch(&node_ids).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(error = %e, "traverse_graph: Content retrieval failed - NO FALLBACKS");
+                    return self.tool_error(
+                        id,
+                        &format!("Failed to retrieve content: {}. NO FALLBACKS.", e),
+                    );
+                }
+            };
+
+            for (i, node) in nodes.iter_mut().enumerate() {
+                if let Some(Some(ref content)) = contents.get(i) {
+                    node.content = Some(content.clone());
+                }
+            }
+        }
+
+        let truncated = paths.len() >= max_results;
+        let path_count = paths.len();
+
+        let response = TraverseGraphResponse {
+            start_memory_id: start_uuid,
+            max_hops,
+            edge_type_filter,
+            nodes,
+            paths,
+            unique_nodes_visited: visited.len(),
+            path_count,
+            metadata: TraversalMetadata {
+                min_weight,
+                max_results,
+                truncated,
+                edges_evaluated,
+                edges_filtered_by_weight,
+            },
+        };
+
+        info!(
+            nodes_visited = response.unique_nodes_visited,
+            paths_found = response.path_count,
+            edges_evaluated = edges_evaluated,
+            truncated = truncated,
+            "traverse_graph: Completed graph traversal via EdgeRepository"
+        );
+
+        match serde_json::to_value(&response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => {
+                error!(error = %e, "traverse_graph: Response serialization failed");
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("Response serialization failed: {}", e),
+                )
+            }
+        }
+    }
+
+    /// get_unified_neighbors tool implementation.
+    ///
+    /// Finds neighbors using Weighted RRF fusion across all 14 embedders.
+    /// TASK-GRAPHLINK: Uses EdgeRepository K-NN graphs - NO FALLBACKS.
+    /// Per ARCH-21: Uses Weighted RRF, not weighted sum.
+    /// Per AP-60: Temporal embedders (E2-E4) are excluded from semantic fusion.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Validate request and verify memory exists
+    /// 2. For each semantic embedder (E1, E5-E13, excluding E2-E4):
+    ///    - Query EdgeRepository.get_embedder_edges() for K-NN neighbors
+    ///    - Collect (memory_id, similarity, rank) tuples
+    /// 3. Apply Weighted RRF: `score = Sum(weight_i / (rank_i + k))`
+    /// 4. Rank by fused score, apply min_score filter
+    /// 5. Compute agreement summary
+    /// 6. Optionally hydrate content
+    ///
+    /// # Parameters
+    ///
+    /// - `memory_id`: UUID of the memory to find neighbors for (required)
+    /// - `weight_profile`: Profile for embedder weights (default: "semantic_search")
+    /// - `top_k`: Number of neighbors to return (1-50, default: 10)
+    /// - `min_score`: Minimum RRF score threshold (0-1, default: 0.0)
+    /// - `include_content`: Include full content text (default: false)
+    /// - `include_embedder_breakdown`: Include per-embedder scores/ranks (default: true)
+    pub(crate) async fn call_get_unified_neighbors(
+        &self,
+        id: Option<JsonRpcId>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        // NO FALLBACKS — edges must be built at startup. If empty, fail fast.
+
+        // TASK-GRAPHLINK: Require EdgeRepository - NO FALLBACKS
+        let edge_repo = match &self.edge_repository {
+            Some(repo) => repo,
+            None => {
+                error!("get_unified_neighbors: EdgeRepository not available - NO FALLBACKS");
+                return self.tool_error(
+                    id,
+                    "Graph linking not initialized. EdgeRepository is required - NO FALLBACKS.",
+                );
+            }
+        };
+
+        // Parse and validate request
+        let (request, memory_uuid) = match self
+            .parse_request_validated::<GetUnifiedNeighborsRequest>(
+                id.clone(),
+                args,
+                "get_unified_neighbors",
+            ) {
+            Ok(pair) => pair,
+            Err(resp) => return resp,
+        };
+
+        let weight_profile = &request.weight_profile;
+        let top_k = request.top_k;
+        let min_score = request.min_score;
+
+        info!(
+            memory_id = %memory_uuid,
+            weight_profile = %weight_profile,
+            top_k = top_k,
+            min_score = min_score,
+            "get_unified_neighbors: Starting unified neighbor search via EdgeRepository"
+        );
+
+        // Step 1: Verify memory exists
+        match self.teleological_store.retrieve(memory_uuid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!(memory_id = %memory_uuid, "get_unified_neighbors: Memory not found");
+                return self.tool_error(id, &format!("Memory not found: {}", memory_uuid));
+            }
+            Err(e) => {
+                error!(error = %e, "get_unified_neighbors: Failed to retrieve memory");
+                return self.tool_error(id, &format!("Failed to retrieve memory: {}", e));
+            }
+        };
+
+        // Step 2: Get weight profile for RRF fusion
+        // GAP-1: custom_weights overrides weight_profile
+        // AP-NAV-01: FAIL FAST on invalid embedder names
+        let mut weights = if let Some(ref custom) = request.custom_weights {
+            for key in custom.keys() {
+                if !EMBEDDER_NAMES.contains(&key.as_str()) {
+                    error!(invalid_key = %key, "get_unified_neighbors: custom_weights contains invalid embedder name");
+                    return self.tool_error(
+                        id,
+                        &format!(
+                            "Invalid embedder name '{}' in custom_weights. Valid names: E1-E14.",
+                            key
+                        ),
+                    );
+                }
+            }
+            let mut w = [0.0f32; 14];
+            for (i, name) in EMBEDDER_NAMES.iter().enumerate() {
+                if let Some(&val) = custom.get(*name) {
+                    w[i] = val as f32;
+                }
+            }
+            if !context_graph_core::weights::E5_CAUSAL_ENABLED && w[4] > 0.0 {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    "E5 causal embedder is retired and disabled; custom_weights.E5 must be 0.0",
+                );
+            }
+            if !context_graph_core::weights::E11_ENTITY_ENABLED && w[10] > 0.0 {
+                return self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Validation,
+                    "E11 entity embedder is disabled; custom_weights.E11 must be 0.0",
+                );
+            }
+            // Validate weights
+            if let Err(e) = context_graph_core::weights::validate_weights(&w) {
+                error!(error = %e, "get_unified_neighbors: Invalid custom weights");
+                return self.tool_error(id, &format!("Invalid custom weights: {}", e));
+            }
+            w
+        } else {
+            match get_effective_weight_profile(weight_profile) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!(error = %e, "get_unified_neighbors: Invalid weight profile");
+                    return self.tool_error(id, &format!("Invalid weight profile: {}", e));
+                }
+            }
+        };
+
+        // GAP-8: Apply embedder exclusions
+        // AP-NAV-01: FAIL FAST on invalid embedder names
+        if !request.exclude_embedders.is_empty() {
+            for name in &request.exclude_embedders {
+                match embedder_name_to_index(name) {
+                    Ok(idx) => {
+                        weights[idx] = 0.0;
+                    }
+                    Err(msg) => {
+                        error!(embedder = %name, "get_unified_neighbors: Invalid embedder in exclude_embedders");
+                        return self.tool_error(id, &msg);
+                    }
+                }
+            }
+            let sum: f32 = weights.iter().sum();
+            if sum > 0.0 {
+                for w in weights.iter_mut() {
+                    *w /= sum;
+                }
+            } else {
+                return self.tool_error(
+                    id,
+                    "All embedders excluded - at least one must have weight > 0",
+                );
+            }
+        }
+
+        let graph_learning_policy = if let Some(policy_request) = request.learning_policy.as_ref() {
+            let Some(rocksdb_store) = self
+                .teleological_store
+                .as_any()
+                .downcast_ref::<context_graph_storage::teleological::RocksDbTeleologicalStore>(
+            ) else {
+                error!("get_unified_neighbors: learning_policy requires RocksDbTeleologicalStore");
+                return self.tool_error(
+                    id,
+                    "learning_policy requires RocksDbTeleologicalStore so graph LearningEvents can be read.",
+                );
+            };
+            let policy = match resolve_graph_learning_policy(
+                rocksdb_store,
+                GraphLearningPolicyResolveParams {
+                    source_memory_id: Some(memory_uuid),
+                    policy_scope: policy_request.policy_scope.clone(),
+                    base_weights: weights,
+                    min_evidence: policy_request.min_evidence,
+                    max_scan: policy_request.max_scan,
+                    learning_rate: policy_request.learning_rate,
+                    include_evidence: policy_request.include_evidence,
+                },
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(error = %e, "get_unified_neighbors: graph learning policy resolve failed");
+                    return self
+                        .tool_error(id, &format!("graph learning policy resolve failed: {e}"));
+                }
+            };
+            weights = policy.learned_weights;
+            Some(policy)
+        } else {
+            None
+        };
+
+        // Step 3: Query K-NN graphs from each semantic embedder (excluding E2-E4 temporal)
+        let mut all_candidates: HashMap<Uuid, CandidateInfo> = HashMap::new();
+        let mut total_candidates_evaluated = 0;
+        let mut embedder_contribution_counts: [usize; 14] = [0; 14];
+
+        for &embedder_idx in &SEMANTIC_EMBEDDER_INDICES {
+            // Query K-NN edges from EdgeRepository - NO FALLBACKS
+            let embedder_edges = match edge_repo.get_embedder_edges(embedder_idx as u8, memory_uuid)
+            {
+                Ok(edges) => edges,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        memory_id = %memory_uuid,
+                        embedder_id = embedder_idx,
+                        "get_unified_neighbors: EdgeRepository query failed - NO FALLBACKS"
+                    );
+                    return self.tool_error(
+                        id,
+                        &format!(
+                            "EdgeRepository query failed for embedder {}: {}. NO FALLBACKS.",
+                            embedder_idx, e
+                        ),
+                    );
+                }
+            };
+
+            total_candidates_evaluated += embedder_edges.len();
+
+            // Process results and assign ranks (1-based)
+            for (rank, edge) in embedder_edges.iter().enumerate() {
+                let neighbor_id = edge.target();
+
+                let entry = all_candidates
+                    .entry(neighbor_id)
+                    .or_insert_with(|| CandidateInfo {
+                        embedder_scores: [0.0; 14],
+                        embedder_ranks: [0; 14],
+                        contributing_embedders: Vec::new(),
+                    });
+
+                // Store score and rank for this embedder (1-based rank for RRF)
+                entry.embedder_scores[embedder_idx] = edge.similarity();
+                entry.embedder_ranks[embedder_idx] = rank + 1; // 1-based rank
+                entry
+                    .contributing_embedders
+                    .push(embedder_name(embedder_idx).to_string());
+
+                embedder_contribution_counts[embedder_idx] += 1;
+            }
+        }
+
+        info!(
+            total_candidates_evaluated = total_candidates_evaluated,
+            unique_candidates = all_candidates.len(),
+            "get_unified_neighbors: Retrieved K-NN edges from {} embedders",
+            SEMANTIC_EMBEDDER_INDICES.len()
+        );
+
+        // Step 4: Apply Weighted RRF fusion
+        // RRF_score(d) = Sum over embedders i: weight_i / (rank_i(d) + k)
+        let mut fused_candidates: Vec<(Uuid, f32, CandidateInfo, f32)> = all_candidates
+            .into_iter()
+            .map(|(memory_id, info)| {
+                let mut rrf_score = 0.0;
+
+                for &embedder_idx in &SEMANTIC_EMBEDDER_INDICES {
+                    let rank = info.embedder_ranks[embedder_idx];
+                    if rank > 0 {
+                        // Only count if this embedder found this candidate
+                        let weight = weights[embedder_idx];
+                        rrf_score += weight / (rank as f32 + RRF_K);
+                    }
+                }
+
+                let (rrf_score, learning_boost) = graph_learning_policy
+                    .as_ref()
+                    .map(|policy| policy.apply_score(memory_id, rrf_score))
+                    .unwrap_or((rrf_score, 0.0));
+
+                (memory_id, rrf_score, info, learning_boost)
+            })
+            .collect();
+
+        // Sort by RRF score descending
+        fused_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let unique_candidates = fused_candidates.len();
+
+        // Step 5: Filter by min_score and take top_k
+        let mut filtered_count = 0;
+        let neighbors: Vec<UnifiedNeighborResult> = fused_candidates
+            .into_iter()
+            .filter(|(_, score, _, _)| {
+                if *score < min_score {
+                    filtered_count += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .take(top_k)
+            .map(|(neighbor_id, rrf_score, info, _learning_boost)| {
+                let embedder_count = info.contributing_embedders.len();
+                UnifiedNeighborResult {
+                    neighbor_id,
+                    rrf_score,
+                    embedder_count,
+                    contributing_embedders: info.contributing_embedders,
+                    embedder_scores: if request.include_embedder_breakdown {
+                        Some(info.embedder_scores)
+                    } else {
+                        None
+                    },
+                    embedder_ranks: if request.include_embedder_breakdown {
+                        Some(info.embedder_ranks)
+                    } else {
+                        None
+                    },
+                    content: None,
+                    source: None,
+                }
+            })
+            .collect();
+
+        // Step 6: Compute agreement summary
+        let mut strong_agreement = 0;
+        let mut moderate_agreement = 0;
+        let mut weak_agreement = 0;
+
+        for neighbor in &neighbors {
+            match neighbor.embedder_count {
+                n if n >= 6 => strong_agreement += 1,
+                n if n >= 3 => moderate_agreement += 1,
+                _ => weak_agreement += 1,
+            }
+        }
+
+        // Build top contributing embedders list
+        let mut top_contributing_embedders: Vec<EmbedderContribution> = SEMANTIC_EMBEDDER_INDICES
+            .iter()
+            .map(|&idx| EmbedderContribution {
+                embedder_name: embedder_name(idx).to_string(),
+                contribution_count: embedder_contribution_counts[idx],
+                weight: weights[idx],
+            })
+            .filter(|c| c.contribution_count > 0)
+            .collect();
+
+        top_contributing_embedders
+            .sort_by_key(|embedder| std::cmp::Reverse(embedder.contribution_count));
+        top_contributing_embedders.truncate(5); // Top 5 contributing embedders
+
+        // Step 7: Optionally hydrate content
+        let mut neighbors = neighbors;
+        if request.include_content && !neighbors.is_empty() {
+            let neighbor_ids: Vec<Uuid> = neighbors.iter().map(|n| n.neighbor_id).collect();
+
+            // Get content - NO FALLBACKS
+            let contents: Vec<Option<String>> = match self
+                .teleological_store
+                .get_content_batch(&neighbor_ids)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(error = %e, "get_unified_neighbors: Content retrieval failed - NO FALLBACKS");
+                    return self.tool_error(
+                        id,
+                        &format!("Failed to retrieve content: {}. NO FALLBACKS.", e),
+                    );
+                }
+            };
+
+            // Get source metadata - NO FALLBACKS
+            let source_metadata = match self
+                .teleological_store
+                .get_source_metadata_batch(&neighbor_ids)
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(error = %e, "get_unified_neighbors: Source metadata retrieval failed - NO FALLBACKS");
+                    return self.tool_error(
+                        id,
+                        &format!("Failed to retrieve source metadata: {}. NO FALLBACKS.", e),
+                    );
+                }
+            };
+
+            for (i, neighbor) in neighbors.iter_mut().enumerate() {
+                if let Some(Some(ref content)) = contents.get(i) {
+                    neighbor.content = Some(content.clone());
+                }
+                if let Some(Some(ref metadata)) = source_metadata.get(i) {
+                    neighbor.source = Some(NeighborSourceInfo {
+                        source_type: format!("{}", metadata.source_type),
+                        file_path: metadata.file_path.clone(),
+                    });
+                }
+            }
+        }
+
+        let response = GetUnifiedNeighborsResponse {
+            memory_id: memory_uuid,
+            weight_profile: weight_profile.clone(),
+            count: neighbors.len(),
+            neighbors,
+            agreement_summary: AgreementSummary {
+                strong_agreement,
+                moderate_agreement,
+                weak_agreement,
+                top_contributing_embedders,
+            },
+            metadata: UnifiedNeighborMetadata {
+                total_candidates_evaluated,
+                unique_candidates,
+                filtered_by_score: filtered_count,
+                rrf_k: RRF_K,
+                excluded_embedders: vec![
+                    "E2 (V_freshness)".to_string(),
+                    "E3 (V_periodicity)".to_string(),
+                    "E4 (V_ordering)".to_string(),
+                ],
+                fusion_strategy: "weighted_rrf".to_string(),
+                graph_learning_policy: graph_learning_policy
+                    .as_ref()
+                    .map(|policy| policy.metadata(request.learning_policy.as_ref().is_some())),
+            },
+        };
+
+        info!(
+            neighbors_found = response.count,
+            unique_candidates = unique_candidates,
+            strong_agreement = strong_agreement,
+            moderate_agreement = moderate_agreement,
+            weak_agreement = weak_agreement,
+            "get_unified_neighbors: Completed unified neighbor search via EdgeRepository"
+        );
+
+        match serde_json::to_value(&response) {
+            Ok(v) => self.tool_result(id, v),
+            Err(e) => {
+                error!(error = %e, "get_unified_neighbors: Response serialization failed");
+                self.tool_error_typed(
+                    id,
+                    ToolErrorKind::Execution,
+                    &format!("Response serialization failed: {}", e),
+                )
+            }
+        }
+    }
+}
+
+/// Internal struct to track candidate information during RRF fusion.
+struct CandidateInfo {
+    /// Per-embedder similarity scores (0.0 if not found).
+    embedder_scores: [f32; 14],
+    /// Per-embedder ranks (0 if not found).
+    embedder_ranks: [usize; 14],
+    /// Names of contributing embedders.
+    contributing_embedders: Vec<String>,
+}
+
+/// Convert string edge type to GraphLinkEdgeType.
+fn string_to_edge_type(s: &str) -> Option<GraphLinkEdgeType> {
+    match s {
+        "semantic_similar" => Some(GraphLinkEdgeType::SemanticSimilar),
+        "code_related" => Some(GraphLinkEdgeType::CodeRelated),
+        "entity_shared" => Some(GraphLinkEdgeType::EntityShared),
+        "causal_chain" => Some(GraphLinkEdgeType::CausalChain),
+        "graph_connected" => Some(GraphLinkEdgeType::GraphConnected),
+        "paraphrase_aligned" => Some(GraphLinkEdgeType::ParaphraseAligned),
+        "keyword_overlap" => Some(GraphLinkEdgeType::KeywordOverlap),
+        "multi_agreement" => Some(GraphLinkEdgeType::MultiAgreement),
+        _ => None,
+    }
+}
+
+/// Convert GraphLinkEdgeType to string representation.
+fn edge_type_to_string(edge_type: GraphLinkEdgeType) -> String {
+    match edge_type {
+        GraphLinkEdgeType::SemanticSimilar => "semantic_similar".to_string(),
+        GraphLinkEdgeType::CodeRelated => "code_related".to_string(),
+        GraphLinkEdgeType::EntityShared => "entity_shared".to_string(),
+        GraphLinkEdgeType::CausalChain => "causal_chain".to_string(),
+        GraphLinkEdgeType::GraphConnected => "graph_connected".to_string(),
+        GraphLinkEdgeType::ParaphraseAligned => "paraphrase_aligned".to_string(),
+        GraphLinkEdgeType::KeywordOverlap => "keyword_overlap".to_string(),
+        GraphLinkEdgeType::MultiAgreement => "multi_agreement".to_string(),
+    }
+}
+
+/// Get contributing embedder names from bitmask.
+fn get_contributing_embedders(mask: u16) -> Vec<String> {
+    let mut result = Vec::new();
+    for i in 0..NUM_EMBEDDERS {
+        if (mask >> i) & 1 == 1 {
+            result.push(embedder_name(i).to_string());
+        }
+    }
+    result
+}
+
+/// Compute weighted agreement from embedder scores.
+/// Per Constitution: weighted_agreement = Sum(topic_weight_i × is_clustered_i)
+fn compute_weighted_agreement(scores: &[f32; 14]) -> f32 {
+    // Topic weights per constitution
+    // SEMANTIC: E1, E5, E6, E7, E10, E12, E13 = 1.0
+    // RELATIONAL: E8, E11 = 0.5
+    // STRUCTURAL: E9 = 0.5
+    // TEMPORAL: E2, E3, E4 = 0.0 (never count toward topics)
+    let topic_weights: [f32; 14] = [
+        1.0, // E1 - semantic
+        0.0, // E2 - temporal (excluded)
+        0.0, // E3 - temporal (excluded)
+        0.0, // E4 - temporal (excluded)
+        1.0, // E5 - semantic
+        1.0, // E6 - semantic
+        1.0, // E7 - semantic
+        0.5, // E8 - relational
+        0.5, // E9 - structural
+        1.0, // E10 - semantic
+        0.5, // E11 - relational
+        1.0, // E12 - semantic
+        1.0, // E13 - semantic
+        1.0, // E14 - semantic (BGE-M3 Dense)
+    ];
+
+    let mut agreement = 0.0;
+    for (i, &score) in scores.iter().enumerate() {
+        if score > 0.5 {
+            // Is clustered if score > threshold
+            agreement += topic_weights[i];
+        }
+    }
+    agreement
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_edge_type_conversions_and_helpers() {
+        assert_eq!(
+            string_to_edge_type("semantic_similar"),
+            Some(GraphLinkEdgeType::SemanticSimilar)
+        );
+        assert_eq!(
+            string_to_edge_type("code_related"),
+            Some(GraphLinkEdgeType::CodeRelated)
+        );
+        assert_eq!(string_to_edge_type("invalid"), None);
+        assert_eq!(
+            edge_type_to_string(GraphLinkEdgeType::SemanticSimilar),
+            "semantic_similar"
+        );
+        assert_eq!(
+            edge_type_to_string(GraphLinkEdgeType::CausalChain),
+            "causal_chain"
+        );
+        // Contributing embedders from bitmask
+        let mask: u16 = 0b0000_0101_0001; // E1, E5, E7
+        let embedders = get_contributing_embedders(mask);
+        assert_eq!(embedders.len(), 3);
+        assert!(embedders.contains(&"E1 (V_meaning)".to_string()));
+    }
+
+    #[test]
+    fn test_weighted_agreement_and_rrf() {
+        // All semantic embedders agree
+        let scores: [f32; 14] = [
+            0.9, 0.0, 0.0, 0.0, 0.8, 0.75, 0.85, 0.6, 0.55, 0.7, 0.65, 0.8, 0.7, 0.8,
+        ];
+        assert!((compute_weighted_agreement(&scores) - 9.5).abs() < 0.01);
+        // Only temporal = 0 agreement
+        let temporal_only: [f32; 14] = [
+            0.0, 0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        assert!((compute_weighted_agreement(&temporal_only) - 0.0).abs() < 0.01);
+        // RRF formula: rank=1 > rank=10
+        let k = 60.0f32;
+        assert!(0.33 / (1.0 + k) > 0.33 / (10.0 + k));
+    }
+}

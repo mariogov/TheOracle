@@ -1,0 +1,9 @@
+{
+  "$schema": "https://code.claude.com/schemas/mcp.json",
+  "mcpServers": {
+    "cgreality": {
+      "type": "http",
+      "url": "http://127.0.0.1:3101/mcp"
+    }
+  }
+}
